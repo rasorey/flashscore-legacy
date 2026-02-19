@@ -7,6 +7,7 @@ import pickle
 import re
 import time
 import unicodedata
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -3352,8 +3353,21 @@ def build_calendar(gamelist: dict[str, dict[str, Any]]) -> Calendar:
 
 def save_calendar(calendar: Calendar, calendar_file: Path) -> None:
     calendar_file.parent.mkdir(parents=True, exist_ok=True)
+    # ics==0.7.x serializes alarms via str(Component), which emits a known FutureWarning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"Behaviour of str\(Component\) will change in version 0\.9 "
+                r"to only return a short description, NOT the ics representation\. "
+                r"Use the explicit Component\.serialize\(\) to get the ics representation\."
+            ),
+            category=FutureWarning,
+            module=r"ics\.component",
+        )
+        serialized_calendar = calendar.serialize()
     with calendar_file.open("w", encoding="utf-8") as handle:
-        handle.writelines(calendar.serialize_iter())
+        handle.write(serialized_calendar)
 
 
 def main() -> None:
