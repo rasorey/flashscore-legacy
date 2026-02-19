@@ -2073,6 +2073,21 @@ def extract_scores(fields: dict[str, str]) -> tuple[Optional[int], Optional[int]
     return None, None
 
 
+def parse_counter_value(raw_value: Optional[str]) -> Optional[int]:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text or not text.isdigit():
+        return None
+    return int(text)
+
+
+def extract_red_cards(fields: dict[str, str]) -> tuple[Optional[int], Optional[int]]:
+    home_cards = parse_counter_value(fields.get("AJ"))
+    away_cards = parse_counter_value(fields.get("AK"))
+    return home_cards, away_cards
+
+
 def extract_individual_position(fields: dict[str, str]) -> str:
     for key in MOTORSPORT_POSITION_FIELD_KEYS:
         value = str(fields.get(key, "")).strip()
@@ -2294,6 +2309,12 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         event["score_home"] = score_home
         event["score_away"] = score_away
 
+    red_cards_home, red_cards_away = extract_red_cards(fields)
+    if red_cards_home is not None and red_cards_home > 0:
+        event["red_cards_home"] = red_cards_home
+    if red_cards_away is not None and red_cards_away > 0:
+        event["red_cards_away"] = red_cards_away
+
     result_status = extract_result_status(fields)
     if result_status:
         event["result_status"] = result_status
@@ -2314,7 +2335,18 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
 def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str, Any]) -> dict[str, Any]:
     merged = existing_event.copy()
 
-    for key in ("league", "team1", "team2", "result_status", "url", "rank_home", "rank_away", "first_leg_result"):
+    for key in (
+        "league",
+        "team1",
+        "team2",
+        "result_status",
+        "url",
+        "rank_home",
+        "rank_away",
+        "first_leg_result",
+        "red_cards_home",
+        "red_cards_away",
+    ):
         if not str(merged.get(key, "")).strip() and str(incoming_event.get(key, "")).strip():
             merged[key] = incoming_event[key]
 
@@ -3130,7 +3162,17 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
         if existing_league:
             enriched["league"] = existing_league
 
-    for key in ("team1", "team2", "result_status", "url", "rank_home", "rank_away", "first_leg_result"):
+    for key in (
+        "team1",
+        "team2",
+        "result_status",
+        "url",
+        "rank_home",
+        "rank_away",
+        "first_leg_result",
+        "red_cards_home",
+        "red_cards_away",
+    ):
         if not str(enriched.get(key, "")).strip() and str(existing_event.get(key, "")).strip():
             enriched[key] = existing_event[key]
 
@@ -3297,6 +3339,34 @@ def build_first_leg_description(event: dict[str, Any]) -> str:
     return f"Ida: {first_leg_text}"
 
 
+def build_red_cards_description(event: dict[str, Any]) -> str:
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name not in {"FÚTBOL", "FUTBOL"}:
+        return ""
+
+    home_cards_raw = event.get("red_cards_home")
+    away_cards_raw = event.get("red_cards_away")
+    home_cards = parse_counter_value(home_cards_raw) or 0
+    away_cards = parse_counter_value(away_cards_raw) or 0
+    if home_cards <= 0 and away_cards <= 0:
+        return ""
+
+    team1 = str(event.get("team1", "")).strip()
+    team2 = str(event.get("team2", "")).strip()
+
+    parts: list[str] = []
+    if home_cards > 0:
+        label = team1 if team1 else "Local"
+        parts.append(f"{label} {home_cards}")
+    if away_cards > 0:
+        label = team2 if team2 else "Visitante"
+        parts.append(f"{label} {away_cards}")
+    if not parts:
+        return ""
+
+    return f"Expulsiones: {', '.join(parts)}"
+
+
 def build_description(event: dict[str, Any]) -> str:
     description_parts: list[str] = []
 
@@ -3307,6 +3377,10 @@ def build_description(event: dict[str, Any]) -> str:
     first_leg_text = build_first_leg_description(event)
     if first_leg_text:
         description_parts.append(first_leg_text)
+
+    red_cards_text = build_red_cards_description(event)
+    if red_cards_text:
+        description_parts.append(red_cards_text)
 
     tv_channels = event.get("tv", [])
     if tv_channels:
@@ -3373,6 +3447,15 @@ def should_extend_overrun_event(
     sport_name = str(event.get("sports", "")).strip().upper()
     if sport_name not in OVERRUN_EXTENSION_SPORTS:
         return False
+
+    has_opponent = bool(str(event.get("team2", "")).strip())
+    if not has_opponent:
+        # For individual competitions, a ranking/position means result published.
+        if str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip():
+            return False
+        participant_rankings = event.get("participant_rankings", [])
+        if isinstance(participant_rankings, list) and any(str(item).strip() for item in participant_rankings):
+            return False
 
     start_utc = event_datetime_utc(event, "date")
     if start_utc > now_utc:
