@@ -81,4 +81,4 @@ Por defecto los archivos se escriben en `/var/www/html`:
 
 - La fusión de eventos de golf consolida jugadores por competición y elimina duplicados de nombres (normalizando mayúsculas, acentos y espacios).
 - En competiciones individuales se añade `participant_rankings` cuando hay datos de ranking.
-- En partidos de fútbol, si el feed incluye los contadores `AJ/AK`, se añade el resumen de expulsiones en la descripción del evento.
+- En partidos de fútbol, si el feed incluye los contadores `AJ/AK`, se añade el resumen de expulsiones en la descripción y una tarjeta roja junto al nombre del equipo en el título.

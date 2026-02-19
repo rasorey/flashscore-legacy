@@ -3257,14 +3257,25 @@ def merge_with_existing_events(
 
 
 def build_event_name(event: dict[str, Any], description: str = "") -> str:
+    def team_with_red_card(team_name: Any, red_cards_value: Any) -> str:
+        team_text = str(team_name or "").strip()
+        if not team_text:
+            return ""
+        red_cards = parse_counter_value(red_cards_value) or 0
+        if red_cards <= 0:
+            return team_text
+        if red_cards == 1:
+            return f"{team_text} 🟥"
+        return f"{team_text} 🟥x{red_cards}"
+
     parts: list[str] = []
     sport = event.get("sports", "")
     if sport:
         parts.append(f"{sport}: ")
 
     name = "".join(parts)
-    team1 = event.get("team1")
-    team2 = event.get("team2")
+    team1 = team_with_red_card(event.get("team1"), event.get("red_cards_home"))
+    team2 = team_with_red_card(event.get("team2"), event.get("red_cards_away"))
     score_home = event.get("score_home")
     score_away = event.get("score_away")
 
