@@ -758,6 +758,12 @@ def build_sofascore_event(
     if team2:
         event["team2"] = team2
 
+    end_raw = str(event_obj.get("endTimestamp", "")).strip()
+    if end_raw.isdigit():
+        end_ts = int(end_raw)
+        if end_ts > event["date"]:
+            event["date_end"] = end_ts
+
     score_home = extract_sofascore_score_value(event_obj.get("homeScore"))
     score_away = extract_sofascore_score_value(event_obj.get("awayScore"))
     if score_home is not None and score_away is not None:
@@ -2074,6 +2080,41 @@ def extract_result_status(fields: dict[str, str]) -> str:
     return ""
 
 
+def extract_end_timestamp(fields: dict[str, str], has_opponent: bool) -> int:
+    start_raw = str(fields.get("AD", "")).strip()
+    if not start_raw.isdigit():
+        return 0
+    start_ts = int(start_raw)
+
+    # Primary end timestamp used by Flashscore payload when available.
+    date_end_raw = str(fields.get("AP", "")).strip()
+    if date_end_raw.isdigit():
+        date_end_ts = int(date_end_raw)
+        if date_end_ts > start_ts:
+            return date_end_ts
+
+    # Fallback: AO behaves as "last update" and is near real end for closed fixtures.
+    # Keep this path conservative to avoid polluting in-progress or individual events.
+    if not has_opponent:
+        return 0
+
+    if str(fields.get("AB", "")).strip() != "3":
+        return 0
+
+    date_updated_raw = str(fields.get("AO", "")).strip()
+    if not date_updated_raw.isdigit():
+        return 0
+
+    date_updated_ts = int(date_updated_raw)
+    duration_seconds = date_updated_ts - start_ts
+    if duration_seconds <= 0:
+        return 0
+    if duration_seconds > 48 * 60 * 60:
+        return 0
+
+    return date_updated_ts
+
+
 def normalize_score_text(value: str) -> str:
     if not value:
         return ""
@@ -2234,9 +2275,9 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         if participant_position:
             event["rank_home"] = participant_position
 
-    date_end_raw = fields.get("AP")
-    if date_end_raw and date_end_raw.isdigit():
-        event["date_end"] = int(date_end_raw)
+    date_end_ts = extract_end_timestamp(fields, has_opponent=bool(team2))
+    if date_end_ts:
+        event["date_end"] = date_end_ts
 
     score_home, score_away = extract_scores(fields)
     if score_home is not None and score_away is not None:
