@@ -58,6 +58,9 @@ Por defecto los archivos se escriben en `/var/www/html`:
 | `FLASHSCORE_INDIVIDUAL_MERGE_SPORTS` | `AUTOMOVILISMO,MOTOCICLISMO,CICLISMO` | Deportes individuales a fusionar por competición/fecha. |
 | `FLASHSCORE_CLASSIFICATION_SPORTS` | `TENIS,TENIS DE MESA,BÁDMINTON,BADMINTON` | Deportes con clasificación individual en descripción. |
 | `FLASHSCORE_TEAM_CLASSIFICATION_SPORTS` | `FÚTBOL,FUTBOL,FÚTBOL SALA,FUTBOL SALA` | Deportes con clasificación por equipos. |
+| `FLASHSCORE_OVERRUN_EXTENSION_MINUTES` | `30` | Minutos de extensión que se aplican en cada actualización si un evento sigue en curso más allá de la duración prevista. |
+| `FLASHSCORE_OVERRUN_MAX_HOURS` | `12` | Tope de horas para seguir extendiendo automáticamente un evento pasado de duración. |
+| `FLASHSCORE_OVERRUN_EXTENSION_SPORTS` | `AUTOMOVILISMO,MOTOCICLISMO,CICLISMO` | Deportes donde se activa la extensión automática por sobretiempo (orientado a carreras). |
 | `SOFASCORE_API_BASE_URLS` | `https://www.sofascore.com/api/v1,https://api.sofascore.com/api/v1` | Base URLs para API SofaScore. |
 | `SOFASCORE_FETCH_PAGES` | `3` | Número de páginas de eventos SofaScore a consultar. |
 | `SOFASCORE_DEFAULT_TIMEZONE` | `Europe/Madrid` | Zona horaria por defecto para SofaScore. |

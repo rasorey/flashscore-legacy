@@ -256,6 +256,16 @@ COUNTRY_NAME_OVERRIDES = {
 SOFASCORE_DEFAULT_TIMEZONE = os.environ.get("SOFASCORE_DEFAULT_TIMEZONE", "Europe/Madrid")
 SOFASCORE_USE_CURL_CFFI = os.environ.get("SOFASCORE_USE_CURL_CFFI", "1") == "1"
 SOFASCORE_CURL_CFFI_IMPERSONATE = os.environ.get("SOFASCORE_CURL_CFFI_IMPERSONATE", "chrome124")
+OVERRUN_EXTENSION_MINUTES = max(5, int(os.environ.get("FLASHSCORE_OVERRUN_EXTENSION_MINUTES", "30")))
+OVERRUN_EXTENSION_MAX_HOURS = max(1, int(os.environ.get("FLASHSCORE_OVERRUN_MAX_HOURS", "12")))
+OVERRUN_EXTENSION_SPORTS = {
+    sport.strip().upper()
+    for sport in os.environ.get(
+        "FLASHSCORE_OVERRUN_EXTENSION_SPORTS",
+        "AUTOMOVILISMO,MOTOCICLISMO,CICLISMO",
+    ).split(",")
+    if sport.strip()
+}
 SOFASCORE_NEXT_DATA_PATTERN = re.compile(
     r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
     re.DOTALL | re.IGNORECASE,
@@ -3348,9 +3358,41 @@ def infer_duration(name: str) -> timedelta:
     return timedelta(hours=2)
 
 
+def should_extend_overrun_event(
+    event: dict[str, Any],
+    inferred_duration: timedelta,
+    now_utc: datetime,
+) -> bool:
+    if "date_end" in event:
+        return False
+    if event.get("all_day", False):
+        return False
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
+        return False
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name not in OVERRUN_EXTENSION_SPORTS:
+        return False
+
+    start_utc = event_datetime_utc(event, "date")
+    if start_utc > now_utc:
+        return False
+
+    planned_end_utc = start_utc + inferred_duration
+    if now_utc <= planned_end_utc:
+        return False
+
+    return (now_utc - planned_end_utc) <= timedelta(hours=OVERRUN_EXTENSION_MAX_HOURS)
+
+
 def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: str) -> None:
+    inferred_duration = infer_duration(name)
     if "date_end" not in event:
-        calendar_event.duration = infer_duration(name)
+        now_utc = datetime.now(tz=UTC)
+        if should_extend_overrun_event(event, inferred_duration, now_utc):
+            calendar_event.end = now_utc + timedelta(minutes=OVERRUN_EXTENSION_MINUTES)
+        else:
+            calendar_event.duration = inferred_duration
         return
 
     start = event_datetime_utc(event, "date")
