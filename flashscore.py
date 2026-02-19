@@ -2795,6 +2795,15 @@ def scrape_flashscore_events(urls: list[str]) -> tuple[dict[str, dict[str, Any]]
 
 
 def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
+    def split_participant_names(value: Any) -> list[str]:
+        participant_text = str(value or "")
+        return [participant.strip() for participant in participant_text.split("/") if participant.strip()]
+
+    def participant_key(name: str) -> str:
+        normalized = unicodedata.normalize("NFKD", name)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        return re.sub(r"\s+", " ", ascii_text).strip().upper()
+
     golf_merged: dict[str, dict[str, Any]] = {}
     league_to_first_gameid: dict[str, str] = {}
     keys_to_remove: list[str] = []
@@ -2806,12 +2815,12 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
         league_val = event.get("league", "")
         if league_val in league_to_first_gameid:
             first_game_id = league_to_first_gameid[league_val]
-            golf_merged[first_game_id]["team1"].append(event.get("team1", ""))
+            golf_merged[first_game_id]["team1"].extend(split_participant_names(event.get("team1", "")))
             keys_to_remove.append(game_id)
             continue
 
         event_copy = event.copy()
-        event_copy["team1"] = [event_copy.get("team1", "")]
+        event_copy["team1"] = split_participant_names(event_copy.get("team1", ""))
         golf_merged[game_id] = event_copy
         league_to_first_gameid[league_val] = game_id
         keys_to_remove.append(game_id)
@@ -2820,8 +2829,18 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
         gamelist.pop(key, None)
 
     for game_id, merged_event in golf_merged.items():
-        team_names = [team_name for team_name in merged_event["team1"] if team_name]
-        merged_event["team1"] = "/".join(team_names)
+        unique_participants: list[str] = []
+        seen_participants: set[str] = set()
+        for participant_name in merged_event["team1"]:
+            participant_name = str(participant_name).strip()
+            if not participant_name:
+                continue
+            normalized_name = participant_key(participant_name)
+            if normalized_name in seen_participants:
+                continue
+            seen_participants.add(normalized_name)
+            unique_participants.append(participant_name)
+        merged_event["team1"] = "/".join(unique_participants)
         gamelist[game_id] = merged_event
 
 
