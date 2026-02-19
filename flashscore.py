@@ -1637,6 +1637,85 @@ def extract_primary_participant_id(participants: Any) -> str:
     return str(first_participant.get("eventParticipantId", "")).strip()
 
 
+def is_football_match_event(event: dict[str, Any]) -> bool:
+    sport_name = str(event.get("sports", "")).strip().upper()
+    return sport_name in {"FÚTBOL", "FUTBOL"}
+
+
+def should_fetch_football_cards(event: dict[str, Any]) -> bool:
+    if not is_football_match_event(event):
+        return False
+    if not str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
+        return False
+    return "score_home" in event and "score_away" in event
+
+
+def apply_card_counts_to_event(
+    event: dict[str, Any],
+    yellow_home: Optional[int],
+    yellow_away: Optional[int],
+    red_home: Optional[int],
+    red_away: Optional[int],
+) -> None:
+    card_fields = (
+        ("yellow_cards_home", yellow_home),
+        ("yellow_cards_away", yellow_away),
+        ("red_cards_home", red_home),
+        ("red_cards_away", red_away),
+    )
+    for field_name, raw_value in card_fields:
+        card_count = parse_counter_value(raw_value)
+        if card_count is not None and card_count > 0:
+            event[field_name] = card_count
+        else:
+            event.pop(field_name, None)
+
+
+def apply_cached_cards_to_event(event: dict[str, Any], cache_entry: Any) -> None:
+    if not isinstance(cache_entry, dict):
+        return
+    if not bool(cache_entry.get("cards_fetched", False)):
+        return
+
+    apply_card_counts_to_event(
+        event,
+        cache_entry.get("yellow_cards_home"),
+        cache_entry.get("yellow_cards_away"),
+        cache_entry.get("red_cards_home"),
+        cache_entry.get("red_cards_away"),
+    )
+
+
+def fetch_event_cards_from_statistics(
+    session: requests.Session,
+    gameid: str,
+    page_url: str,
+    page_html: str,
+    environment: dict[str, Any],
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int], bool]:
+    sport_slug = str(environment.get("sport", "")).strip().lower()
+    if sport_slug != "soccer":
+        return None, None, None, None, False
+
+    project_id = extract_project_id_from_environment_data(environment, page_html)
+    feed_sign = extract_feed_sign_from_page_html(page_html)
+    if not feed_sign:
+        soup = BeautifulSoup(page_html, "html.parser")
+        core_script_url, _core_project_id = extract_core_script_context(soup, page_url)
+        feed_sign = extract_feed_sign(session, core_script_url)
+    if not project_id or not feed_sign:
+        return None, None, None, None, False
+
+    stats_payload = fetch_feed_payload(session, project_id, f"df_st_1_{gameid}", feed_sign)
+    if not stats_payload:
+        return None, None, None, None, False
+
+    yellow_home, yellow_away, red_home, red_away, _parsed_any = parse_cards_from_statistics_payload(stats_payload)
+    return yellow_home, yellow_away, red_home, red_away, True
+
+
 def parse_team_standings_rank_map(payload: str) -> dict[str, str]:
     rank_map: dict[str, str] = {}
     if not payload:
@@ -1723,9 +1802,12 @@ def fallback_team_ranks_from_standings(
     return rank_map.get(home_id, ""), rank_map.get(away_id, "")
 
 
-def fetch_event_classification(session: requests.Session, gameid: str) -> tuple[str, str, bool]:
+def fetch_event_classification(
+    session: requests.Session,
+    gameid: str,
+) -> tuple[str, str, Optional[int], Optional[int], Optional[int], Optional[int], bool, bool]:
     if not gameid:
-        return "", "", False
+        return "", "", None, None, None, None, False, False
 
     url = MATCH_DETAIL_URL_TEMPLATE.format(gameid=gameid)
     response = None
@@ -1741,16 +1823,20 @@ def fetch_event_classification(session: requests.Session, gameid: str) -> tuple[
                 time.sleep(0.2)
                 continue
             print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-            return "", "", False
+            return "", "", None, None, None, None, False, False
 
     if response is None:
         if last_error is not None:
             print(f"No se pudo obtener clasificación para {gameid}: {last_error}")
-        return "", "", False
+        return "", "", None, None, None, None, False, False
 
     environment = extract_environment_data(response.text)
     if not environment:
-        return "", "", False
+        return "", "", None, None, None, None, False, False
+
+    yellow_cards_home, yellow_cards_away, red_cards_home, red_cards_away, cards_fetched = (
+        fetch_event_cards_from_statistics(session, gameid, url, response.text, environment)
+    )
 
     participants_data = environment.get("participantsData", {})
     home_participants = participants_data.get("home", [])
@@ -1762,7 +1848,16 @@ def fetch_event_classification(session: requests.Session, gameid: str) -> tuple[
     rank_home = normalize_rank_entry(home_rank_raw)
     rank_away = normalize_rank_entry(away_rank_raw)
     if rank_home or rank_away:
-        return rank_home, rank_away, True
+        return (
+            rank_home,
+            rank_away,
+            yellow_cards_home,
+            yellow_cards_away,
+            red_cards_home,
+            red_cards_away,
+            True,
+            cards_fetched,
+        )
 
     fallback_home, fallback_away = fallback_team_ranks_from_standings(
         session,
@@ -1777,7 +1872,16 @@ def fetch_event_classification(session: requests.Session, gameid: str) -> tuple[
     if fallback_away:
         rank_away = fallback_away
 
-    return rank_home, rank_away, True
+    return (
+        rank_home,
+        rank_away,
+        yellow_cards_home,
+        yellow_cards_away,
+        red_cards_home,
+        red_cards_away,
+        True,
+        cards_fetched,
+    )
 
 
 def apply_classification_to_event(event: dict[str, Any], rank_home: str, rank_away: str) -> None:
@@ -1815,6 +1919,12 @@ def enrich_events_with_classification(
     now_timestamp = int(datetime.now(tz=UTC).timestamp())
     ttl_seconds = max(0, CLASSIFICATION_CACHE_TTL_DAYS) * 24 * 60 * 60
 
+    def counter_or_zero(raw_value: Any) -> int:
+        parsed = parse_counter_value(raw_value)
+        if parsed is None or parsed < 0:
+            return 0
+        return parsed
+
     events_pending_fetch: dict[str, list[dict[str, Any]]] = {}
     for event in gamelist.values():
         if not should_fetch_classification(event):
@@ -1824,28 +1934,47 @@ def enrich_events_with_classification(
         if not gameid:
             continue
 
-        if CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT and event_has_sufficient_rank_data(event):
+        cache_entry = cache_data.get(gameid, {})
+        if not isinstance(cache_entry, dict):
+            cache_entry = {}
+
+        needs_cards_fetch = should_fetch_football_cards(event) and not bool(cache_entry.get("cards_fetched", False))
+
+        if CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT and event_has_sufficient_rank_data(event) and not needs_cards_fetch:
             current_home_rank = str(event.get("rank_home", "")).strip()
             current_away_rank = str(event.get("rank_away", "")).strip()
-            cache_data[gameid] = {
+            updated_cache_entry: dict[str, Any] = {
                 "rank_home": current_home_rank,
                 "rank_away": current_away_rank,
                 "fetched_at": now_timestamp,
             }
+            if bool(cache_entry.get("cards_fetched", False)):
+                updated_cache_entry["cards_fetched"] = True
+                updated_cache_entry["yellow_cards_home"] = counter_or_zero(cache_entry.get("yellow_cards_home"))
+                updated_cache_entry["yellow_cards_away"] = counter_or_zero(cache_entry.get("yellow_cards_away"))
+                updated_cache_entry["red_cards_home"] = counter_or_zero(cache_entry.get("red_cards_home"))
+                updated_cache_entry["red_cards_away"] = counter_or_zero(cache_entry.get("red_cards_away"))
+                apply_cached_cards_to_event(event, updated_cache_entry)
+            cache_data[gameid] = updated_cache_entry
             continue
 
-        cache_entry = cache_data.get(gameid, {})
-        if isinstance(cache_entry, dict):
-            cached_home_rank = str(cache_entry.get("rank_home", "")).strip()
-            cached_away_rank = str(cache_entry.get("rank_away", "")).strip()
-            fetched_at = cache_entry.get("fetched_at", 0)
-            fetched_at_int = int(fetched_at) if str(fetched_at).isdigit() else 0
-            is_fresh = ttl_seconds > 0 and fetched_at_int > 0 and (now_timestamp - fetched_at_int) < ttl_seconds
-            if CLASSIFICATION_REFRESH_EMPTY_CACHE and not cached_home_rank and not cached_away_rank:
-                is_fresh = False
-            if is_fresh:
-                apply_classification_to_event(event, cached_home_rank, cached_away_rank)
-                continue
+        cached_home_rank = str(cache_entry.get("rank_home", "")).strip()
+        cached_away_rank = str(cache_entry.get("rank_away", "")).strip()
+        fetched_at = cache_entry.get("fetched_at", 0)
+        fetched_at_int = int(fetched_at) if str(fetched_at).isdigit() else 0
+        is_fresh = ttl_seconds > 0 and fetched_at_int > 0 and (now_timestamp - fetched_at_int) < ttl_seconds
+        if (
+            CLASSIFICATION_REFRESH_EMPTY_CACHE
+            and not cached_home_rank
+            and not cached_away_rank
+            and not bool(cache_entry.get("cards_fetched", False))
+        ):
+            is_fresh = False
+
+        if is_fresh and not needs_cards_fetch:
+            apply_classification_to_event(event, cached_home_rank, cached_away_rank)
+            apply_cached_cards_to_event(event, cache_entry)
+            continue
 
         events_pending_fetch.setdefault(gameid, []).append(event)
 
@@ -1854,64 +1983,160 @@ def enrich_events_with_classification(
         save_pickle(cache_file, cache_data)
         return
 
-    def apply_cached_ranks_if_available(gameid: str) -> bool:
+    def apply_cached_data_if_available(gameid: str) -> bool:
         cache_entry = cache_data.get(gameid, {})
         if not isinstance(cache_entry, dict):
             return False
+
+        applied = False
         cached_home_rank = str(cache_entry.get("rank_home", "")).strip()
         cached_away_rank = str(cache_entry.get("rank_away", "")).strip()
-        if not cached_home_rank and not cached_away_rank:
-            return False
-        for pending_event in events_pending_fetch.get(gameid, []):
-            apply_classification_to_event(pending_event, cached_home_rank, cached_away_rank)
-        return True
+        if cached_home_rank or cached_away_rank:
+            for pending_event in events_pending_fetch.get(gameid, []):
+                apply_classification_to_event(pending_event, cached_home_rank, cached_away_rank)
+            applied = True
 
-    def apply_fetched_ranks(gameid: str, rank_home: str, rank_away: str, fetch_ok: bool) -> None:
+        if bool(cache_entry.get("cards_fetched", False)):
+            for pending_event in events_pending_fetch.get(gameid, []):
+                apply_cached_cards_to_event(pending_event, cache_entry)
+            applied = True
+
+        return applied
+
+    def apply_fetched_data(
+        gameid: str,
+        rank_home: str,
+        rank_away: str,
+        yellow_cards_home: Optional[int],
+        yellow_cards_away: Optional[int],
+        red_cards_home: Optional[int],
+        red_cards_away: Optional[int],
+        fetch_ok: bool,
+        cards_fetched: bool,
+    ) -> None:
         if not fetch_ok:
-            # Keep stale cached ranks if available, and avoid overwriting cache with empty data.
-            apply_cached_ranks_if_available(gameid)
+            # Keep stale cached enrichment if available, and avoid overwriting cache with empty data.
+            apply_cached_data_if_available(gameid)
             return
 
-        cache_data[gameid] = {
-            "rank_home": rank_home,
-            "rank_away": rank_away,
-            "fetched_at": now_timestamp,
-        }
+        cache_entry = cache_data.get(gameid, {})
+        updated_cache_entry: dict[str, Any] = cache_entry.copy() if isinstance(cache_entry, dict) else {}
+        updated_cache_entry["rank_home"] = rank_home
+        updated_cache_entry["rank_away"] = rank_away
+        updated_cache_entry["fetched_at"] = now_timestamp
+        if cards_fetched:
+            updated_cache_entry["cards_fetched"] = True
+            updated_cache_entry["yellow_cards_home"] = counter_or_zero(yellow_cards_home)
+            updated_cache_entry["yellow_cards_away"] = counter_or_zero(yellow_cards_away)
+            updated_cache_entry["red_cards_home"] = counter_or_zero(red_cards_home)
+            updated_cache_entry["red_cards_away"] = counter_or_zero(red_cards_away)
+        cache_data[gameid] = updated_cache_entry
+
         for pending_event in events_pending_fetch.get(gameid, []):
             apply_classification_to_event(pending_event, rank_home, rank_away)
+            if cards_fetched:
+                apply_card_counts_to_event(
+                    pending_event,
+                    yellow_cards_home,
+                    yellow_cards_away,
+                    red_cards_home,
+                    red_cards_away,
+                )
+            else:
+                apply_cached_cards_to_event(pending_event, updated_cache_entry)
 
     max_workers = min(CLASSIFICATION_MAX_WORKERS, len(gameids_to_fetch))
     if max_workers <= 1:
         with requests.Session() as session:
             for gameid in gameids_to_fetch:
-                rank_home, rank_away, fetch_ok = fetch_event_classification(session, gameid)
-                apply_fetched_ranks(gameid, rank_home, rank_away, fetch_ok)
+                (
+                    rank_home,
+                    rank_away,
+                    yellow_cards_home,
+                    yellow_cards_away,
+                    red_cards_home,
+                    red_cards_away,
+                    fetch_ok,
+                    cards_fetched,
+                ) = fetch_event_classification(session, gameid)
+                apply_fetched_data(
+                    gameid,
+                    rank_home,
+                    rank_away,
+                    yellow_cards_home,
+                    yellow_cards_away,
+                    red_cards_home,
+                    red_cards_away,
+                    fetch_ok,
+                    cards_fetched,
+                )
     else:
         thread_local_session = local()
         worker_sessions: list[requests.Session] = []
         worker_sessions_lock = Lock()
 
-        def fetch_worker(gameid: str) -> tuple[str, str, str, bool]:
+        def fetch_worker(
+            gameid: str,
+        ) -> tuple[str, str, str, Optional[int], Optional[int], Optional[int], Optional[int], bool, bool]:
             session = getattr(thread_local_session, "session", None)
             if session is None:
                 session = requests.Session()
                 thread_local_session.session = session
                 with worker_sessions_lock:
                     worker_sessions.append(session)
-            rank_home, rank_away, fetch_ok = fetch_event_classification(session, gameid)
-            return gameid, rank_home, rank_away, fetch_ok
+            (
+                rank_home,
+                rank_away,
+                yellow_cards_home,
+                yellow_cards_away,
+                red_cards_home,
+                red_cards_away,
+                fetch_ok,
+                cards_fetched,
+            ) = fetch_event_classification(session, gameid)
+            return (
+                gameid,
+                rank_home,
+                rank_away,
+                yellow_cards_home,
+                yellow_cards_away,
+                red_cards_home,
+                red_cards_away,
+                fetch_ok,
+                cards_fetched,
+            )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(fetch_worker, gameid): gameid for gameid in gameids_to_fetch}
             for future in as_completed(futures):
                 gameid = futures[future]
                 try:
-                    fetched_gameid, rank_home, rank_away, fetch_ok = future.result()
+                    (
+                        fetched_gameid,
+                        rank_home,
+                        rank_away,
+                        yellow_cards_home,
+                        yellow_cards_away,
+                        red_cards_home,
+                        red_cards_away,
+                        fetch_ok,
+                        cards_fetched,
+                    ) = future.result()
                 except Exception as exc:
                     print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-                    apply_fetched_ranks(gameid, "", "", False)
+                    apply_fetched_data(gameid, "", "", None, None, None, None, False, False)
                     continue
-                apply_fetched_ranks(fetched_gameid, rank_home, rank_away, fetch_ok)
+                apply_fetched_data(
+                    fetched_gameid,
+                    rank_home,
+                    rank_away,
+                    yellow_cards_home,
+                    yellow_cards_away,
+                    red_cards_home,
+                    red_cards_away,
+                    fetch_ok,
+                    cards_fetched,
+                )
 
         for session in worker_sessions:
             session.close()
@@ -2086,6 +2311,49 @@ def extract_red_cards(fields: dict[str, str]) -> tuple[Optional[int], Optional[i
     home_cards = parse_counter_value(fields.get("AJ"))
     away_cards = parse_counter_value(fields.get("AK"))
     return home_cards, away_cards
+
+
+def normalize_stat_label(text: Any) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", ascii_text).strip().lower()
+
+
+def parse_cards_from_statistics_payload(payload: str) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int], bool]:
+    if not payload:
+        return None, None, None, None, False
+
+    yellow_home: Optional[int] = None
+    yellow_away: Optional[int] = None
+    red_home: Optional[int] = None
+    red_away: Optional[int] = None
+    parsed_any = False
+
+    for blob in normalize_feed_payload(payload).split("¬~"):
+        if "SG÷" not in blob:
+            continue
+        fields = parse_event_fields(blob if blob.endswith("¬") else f"{blob}¬")
+        label = normalize_stat_label(fields.get("SG", ""))
+        if not label:
+            continue
+
+        home_value = parse_counter_value(fields.get("SH"))
+        away_value = parse_counter_value(fields.get("SI"))
+        if home_value is None or away_value is None:
+            continue
+
+        if "amarill" in label or ("yellow" in label and "card" in label):
+            yellow_home = max(yellow_home or 0, home_value)
+            yellow_away = max(yellow_away or 0, away_value)
+            parsed_any = True
+            continue
+
+        if "roj" in label or ("red" in label and "card" in label):
+            red_home = max(red_home or 0, home_value)
+            red_away = max(red_away or 0, away_value)
+            parsed_any = True
+
+    return yellow_home, yellow_away, red_home, red_away, parsed_any
 
 
 def extract_individual_position(fields: dict[str, str]) -> str:
@@ -2344,6 +2612,8 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
         "rank_home",
         "rank_away",
         "first_leg_result",
+        "yellow_cards_home",
+        "yellow_cards_away",
         "red_cards_home",
         "red_cards_away",
     ):
@@ -3170,6 +3440,8 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
         "rank_home",
         "rank_away",
         "first_leg_result",
+        "yellow_cards_home",
+        "yellow_cards_away",
         "red_cards_home",
         "red_cards_away",
     ):
@@ -3257,16 +3529,26 @@ def merge_with_existing_events(
 
 
 def build_event_name(event: dict[str, Any], description: str = "") -> str:
-    def team_with_red_card(team_name: Any, red_cards_value: Any) -> str:
+    def card_marker(card_icon: str, card_count: int) -> str:
+        if card_count <= 0:
+            return ""
+        if card_count == 1:
+            return card_icon
+        return f"{card_icon}x{card_count}"
+
+    def team_with_cards(team_name: Any, yellow_cards_value: Any, red_cards_value: Any) -> str:
         team_text = str(team_name or "").strip()
         if not team_text:
             return ""
+
+        yellow_cards = parse_counter_value(yellow_cards_value) or 0
         red_cards = parse_counter_value(red_cards_value) or 0
-        if red_cards <= 0:
+        yellow_marker = card_marker("🟨", yellow_cards)
+        red_marker = card_marker("🟥", red_cards)
+        markers = " ".join(marker for marker in (yellow_marker, red_marker) if marker)
+        if not markers:
             return team_text
-        if red_cards == 1:
-            return f"{team_text} 🟥"
-        return f"{team_text} 🟥x{red_cards}"
+        return f"{team_text} {markers}"
 
     parts: list[str] = []
     sport = event.get("sports", "")
@@ -3274,8 +3556,16 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
         parts.append(f"{sport}: ")
 
     name = "".join(parts)
-    team1 = team_with_red_card(event.get("team1"), event.get("red_cards_home"))
-    team2 = team_with_red_card(event.get("team2"), event.get("red_cards_away"))
+    team1 = team_with_cards(
+        event.get("team1"),
+        event.get("yellow_cards_home"),
+        event.get("red_cards_home"),
+    )
+    team2 = team_with_cards(
+        event.get("team2"),
+        event.get("yellow_cards_away"),
+        event.get("red_cards_away"),
+    )
     score_home = event.get("score_home")
     score_away = event.get("score_away")
 
@@ -3378,6 +3668,34 @@ def build_red_cards_description(event: dict[str, Any]) -> str:
     return f"Expulsiones: {', '.join(parts)}"
 
 
+def build_yellow_cards_description(event: dict[str, Any]) -> str:
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name not in {"FÚTBOL", "FUTBOL"}:
+        return ""
+
+    home_cards_raw = event.get("yellow_cards_home")
+    away_cards_raw = event.get("yellow_cards_away")
+    home_cards = parse_counter_value(home_cards_raw) or 0
+    away_cards = parse_counter_value(away_cards_raw) or 0
+    if home_cards <= 0 and away_cards <= 0:
+        return ""
+
+    team1 = str(event.get("team1", "")).strip()
+    team2 = str(event.get("team2", "")).strip()
+
+    parts: list[str] = []
+    if home_cards > 0:
+        label = team1 if team1 else "Local"
+        parts.append(f"{label} {home_cards}")
+    if away_cards > 0:
+        label = team2 if team2 else "Visitante"
+        parts.append(f"{label} {away_cards}")
+    if not parts:
+        return ""
+
+    return f"Amarillas: {', '.join(parts)}"
+
+
 def build_description(event: dict[str, Any]) -> str:
     description_parts: list[str] = []
 
@@ -3388,6 +3706,10 @@ def build_description(event: dict[str, Any]) -> str:
     first_leg_text = build_first_leg_description(event)
     if first_leg_text:
         description_parts.append(first_leg_text)
+
+    yellow_cards_text = build_yellow_cards_description(event)
+    if yellow_cards_text:
+        description_parts.append(yellow_cards_text)
 
     red_cards_text = build_red_cards_description(event)
     if red_cards_text:
