@@ -185,6 +185,14 @@ TEAM_CLASSIFICATION_SPORTS = {
     ).split(",")
     if sport.strip()
 }
+ROUND_ALWAYS_FETCH_SPORTS = {
+    sport.strip().upper()
+    for sport in os.environ.get(
+        "FLASHSCORE_ROUND_ALWAYS_FETCH_SPORTS",
+        "TENIS,TENIS DE MESA,BÁDMINTON,BADMINTON",
+    ).split(",")
+    if sport.strip()
+}
 
 # Manual competition fixes for events where Flashscore feed omits league data.
 KNOWN_COMPETITIONS_BY_GAMEID = {
@@ -1658,12 +1666,16 @@ def should_fetch_football_cards(event: dict[str, Any]) -> bool:
 
 
 def should_fetch_competition_round(event: dict[str, Any]) -> bool:
-    if not is_football_match_event(event):
-        return False
     if not str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
         return False
     if str(event.get("competition_round", "")).strip():
         return False
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name in ROUND_ALWAYS_FETCH_SPORTS:
+        return True
 
     league_name = normalize_league(event.get("league", ""))
     league_upper = league_name.upper()
