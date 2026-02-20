@@ -3224,25 +3224,38 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
         ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         return re.sub(r"\s+", " ", ascii_text).strip().upper()
 
+    def golf_merge_key(event: dict[str, Any]) -> tuple[str, int]:
+        league_key = normalize_league(event.get("league", "")).upper()
+        date_key = event_timestamp(event, "date")
+        return league_key, date_key
+
     golf_merged: dict[str, dict[str, Any]] = {}
-    league_to_first_gameid: dict[str, str] = {}
+    merge_key_to_first_gameid: dict[tuple[str, int], str] = {}
     keys_to_remove: list[str] = []
 
     for game_id, event in list(gamelist.items()):
         if event.get("sports", "").upper() != "GOLF":
             continue
 
-        league_val = event.get("league", "")
-        if league_val in league_to_first_gameid:
-            first_game_id = league_to_first_gameid[league_val]
+        merge_key = golf_merge_key(event)
+        participant_name = str(event.get("team1", "")).strip()
+        participant_rank = str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip()
+
+        if merge_key in merge_key_to_first_gameid:
+            first_game_id = merge_key_to_first_gameid[merge_key]
             golf_merged[first_game_id]["team1"].extend(split_participant_names(event.get("team1", "")))
+            if participant_name and participant_rank:
+                golf_merged[first_game_id]["participant_rankings"].append(f"{participant_name} ({participant_rank})")
             keys_to_remove.append(game_id)
             continue
 
         event_copy = event.copy()
         event_copy["team1"] = split_participant_names(event_copy.get("team1", ""))
+        event_copy["participant_rankings"] = []
+        if participant_name and participant_rank:
+            event_copy["participant_rankings"].append(f"{participant_name} ({participant_rank})")
         golf_merged[game_id] = event_copy
-        league_to_first_gameid[league_val] = game_id
+        merge_key_to_first_gameid[merge_key] = game_id
         keys_to_remove.append(game_id)
 
     for key in keys_to_remove:
@@ -3260,7 +3273,26 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
                 continue
             seen_participants.add(normalized_name)
             unique_participants.append(participant_name)
+
+        unique_rankings: list[str] = []
+        seen_rankings: set[str] = set()
+        for ranking_text in merged_event.get("participant_rankings", []):
+            ranking_value = str(ranking_text).strip()
+            if not ranking_value:
+                continue
+            ranking_key = participant_key(ranking_value)
+            if ranking_key in seen_rankings:
+                continue
+            seen_rankings.add(ranking_key)
+            unique_rankings.append(ranking_value)
+
         merged_event["team1"] = "/".join(unique_participants)
+        merged_event.pop("rank_home", None)
+        merged_event.pop("rank_away", None)
+        if unique_rankings:
+            merged_event["participant_rankings"] = unique_rankings
+        else:
+            merged_event.pop("participant_rankings", None)
         gamelist[game_id] = merged_event
 
 
