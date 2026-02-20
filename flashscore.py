@@ -331,6 +331,11 @@ TWO_LEG_COMPETITION_HINTS = (
     "QUALIFICATION",
     "QUALIFIER",
 )
+KNOCKOUT_ROUND_SEGMENT_PATTERN = re.compile(
+    r"(?:^|\b)(?:play-?offs?|final(?:es)?|semifinal(?:es)?|cuartos?|octavos?|"
+    r"dieciseisavos?|treintaidosavos?|eliminatoria|ronda|1/2|1/4|1/8|1/16|1/32|1/64)(?:$|\b)",
+    re.IGNORECASE,
+)
 
 
 def load_pickle(path: Path, default: Any) -> Any:
@@ -1652,6 +1657,37 @@ def should_fetch_football_cards(event: dict[str, Any]) -> bool:
     return "score_home" in event and "score_away" in event
 
 
+def should_fetch_competition_round(event: dict[str, Any]) -> bool:
+    if not is_football_match_event(event):
+        return False
+    if not str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("competition_round", "")).strip():
+        return False
+
+    league_name = normalize_league(event.get("league", ""))
+    league_upper = league_name.upper()
+    if any(hint in league_upper for hint in TWO_LEG_COMPETITION_HINTS):
+        return True
+    return is_knockout_round_segment(league_name)
+
+
+def apply_competition_round_to_event(event: dict[str, Any], round_text: Any) -> None:
+    normalized_round = str(round_text or "").strip()
+    if normalized_round:
+        event["competition_round"] = normalized_round
+    else:
+        event.pop("competition_round", None)
+
+
+def apply_cached_round_to_event(event: dict[str, Any], cache_entry: Any) -> None:
+    if not isinstance(cache_entry, dict):
+        return
+    if "competition_round" not in cache_entry:
+        return
+    apply_competition_round_to_event(event, cache_entry.get("competition_round"))
+
+
 def apply_card_counts_to_event(
     event: dict[str, Any],
     yellow_home: Optional[int],
@@ -1805,9 +1841,9 @@ def fallback_team_ranks_from_standings(
 def fetch_event_classification(
     session: requests.Session,
     gameid: str,
-) -> tuple[str, str, Optional[int], Optional[int], Optional[int], Optional[int], bool, bool]:
+) -> tuple[str, str, Optional[int], Optional[int], Optional[int], Optional[int], str, bool, bool]:
     if not gameid:
-        return "", "", None, None, None, None, False, False
+        return "", "", None, None, None, None, "", False, False
 
     url = MATCH_DETAIL_URL_TEMPLATE.format(gameid=gameid)
     response = None
@@ -1823,16 +1859,18 @@ def fetch_event_classification(
                 time.sleep(0.2)
                 continue
             print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-            return "", "", None, None, None, None, False, False
+            return "", "", None, None, None, None, "", False, False
 
     if response is None:
         if last_error is not None:
             print(f"No se pudo obtener clasificación para {gameid}: {last_error}")
-        return "", "", None, None, None, None, False, False
+        return "", "", None, None, None, None, "", False, False
 
     environment = extract_environment_data(response.text)
     if not environment:
-        return "", "", None, None, None, None, False, False
+        return "", "", None, None, None, None, "", False, False
+
+    competition_round = extract_competition_round_from_environment(environment)
 
     yellow_cards_home, yellow_cards_away, red_cards_home, red_cards_away, cards_fetched = (
         fetch_event_cards_from_statistics(session, gameid, url, response.text, environment)
@@ -1855,6 +1893,7 @@ def fetch_event_classification(
             yellow_cards_away,
             red_cards_home,
             red_cards_away,
+            competition_round,
             True,
             cards_fetched,
         )
@@ -1879,6 +1918,7 @@ def fetch_event_classification(
         yellow_cards_away,
         red_cards_home,
         red_cards_away,
+        competition_round,
         True,
         cards_fetched,
     )
@@ -1939,8 +1979,14 @@ def enrich_events_with_classification(
             cache_entry = {}
 
         needs_cards_fetch = should_fetch_football_cards(event) and not bool(cache_entry.get("cards_fetched", False))
+        needs_round_fetch = should_fetch_competition_round(event) and "competition_round" not in cache_entry
 
-        if CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT and event_has_sufficient_rank_data(event) and not needs_cards_fetch:
+        if (
+            CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT
+            and event_has_sufficient_rank_data(event)
+            and not needs_cards_fetch
+            and not needs_round_fetch
+        ):
             current_home_rank = str(event.get("rank_home", "")).strip()
             current_away_rank = str(event.get("rank_away", "")).strip()
             updated_cache_entry: dict[str, Any] = {
@@ -1948,6 +1994,9 @@ def enrich_events_with_classification(
                 "rank_away": current_away_rank,
                 "fetched_at": now_timestamp,
             }
+            if "competition_round" in cache_entry:
+                updated_cache_entry["competition_round"] = str(cache_entry.get("competition_round", "")).strip()
+                apply_cached_round_to_event(event, updated_cache_entry)
             if bool(cache_entry.get("cards_fetched", False)):
                 updated_cache_entry["cards_fetched"] = True
                 updated_cache_entry["yellow_cards_home"] = counter_or_zero(cache_entry.get("yellow_cards_home"))
@@ -1968,12 +2017,14 @@ def enrich_events_with_classification(
             and not cached_home_rank
             and not cached_away_rank
             and not bool(cache_entry.get("cards_fetched", False))
+            and "competition_round" not in cache_entry
         ):
             is_fresh = False
 
-        if is_fresh and not needs_cards_fetch:
+        if is_fresh and not needs_cards_fetch and not needs_round_fetch:
             apply_classification_to_event(event, cached_home_rank, cached_away_rank)
             apply_cached_cards_to_event(event, cache_entry)
+            apply_cached_round_to_event(event, cache_entry)
             continue
 
         events_pending_fetch.setdefault(gameid, []).append(event)
@@ -2001,6 +2052,11 @@ def enrich_events_with_classification(
                 apply_cached_cards_to_event(pending_event, cache_entry)
             applied = True
 
+        if "competition_round" in cache_entry:
+            for pending_event in events_pending_fetch.get(gameid, []):
+                apply_cached_round_to_event(pending_event, cache_entry)
+            applied = True
+
         return applied
 
     def apply_fetched_data(
@@ -2011,6 +2067,7 @@ def enrich_events_with_classification(
         yellow_cards_away: Optional[int],
         red_cards_home: Optional[int],
         red_cards_away: Optional[int],
+        competition_round: str,
         fetch_ok: bool,
         cards_fetched: bool,
     ) -> None:
@@ -2024,6 +2081,7 @@ def enrich_events_with_classification(
         updated_cache_entry["rank_home"] = rank_home
         updated_cache_entry["rank_away"] = rank_away
         updated_cache_entry["fetched_at"] = now_timestamp
+        updated_cache_entry["competition_round"] = str(competition_round or "").strip()
         if cards_fetched:
             updated_cache_entry["cards_fetched"] = True
             updated_cache_entry["yellow_cards_home"] = counter_or_zero(yellow_cards_home)
@@ -2044,6 +2102,7 @@ def enrich_events_with_classification(
                 )
             else:
                 apply_cached_cards_to_event(pending_event, updated_cache_entry)
+            apply_competition_round_to_event(pending_event, competition_round)
 
     max_workers = min(CLASSIFICATION_MAX_WORKERS, len(gameids_to_fetch))
     if max_workers <= 1:
@@ -2056,6 +2115,7 @@ def enrich_events_with_classification(
                     yellow_cards_away,
                     red_cards_home,
                     red_cards_away,
+                    competition_round,
                     fetch_ok,
                     cards_fetched,
                 ) = fetch_event_classification(session, gameid)
@@ -2067,6 +2127,7 @@ def enrich_events_with_classification(
                     yellow_cards_away,
                     red_cards_home,
                     red_cards_away,
+                    competition_round,
                     fetch_ok,
                     cards_fetched,
                 )
@@ -2077,7 +2138,7 @@ def enrich_events_with_classification(
 
         def fetch_worker(
             gameid: str,
-        ) -> tuple[str, str, str, Optional[int], Optional[int], Optional[int], Optional[int], bool, bool]:
+        ) -> tuple[str, str, str, Optional[int], Optional[int], Optional[int], Optional[int], str, bool, bool]:
             session = getattr(thread_local_session, "session", None)
             if session is None:
                 session = requests.Session()
@@ -2091,6 +2152,7 @@ def enrich_events_with_classification(
                 yellow_cards_away,
                 red_cards_home,
                 red_cards_away,
+                competition_round,
                 fetch_ok,
                 cards_fetched,
             ) = fetch_event_classification(session, gameid)
@@ -2102,6 +2164,7 @@ def enrich_events_with_classification(
                 yellow_cards_away,
                 red_cards_home,
                 red_cards_away,
+                competition_round,
                 fetch_ok,
                 cards_fetched,
             )
@@ -2119,12 +2182,13 @@ def enrich_events_with_classification(
                         yellow_cards_away,
                         red_cards_home,
                         red_cards_away,
+                        competition_round,
                         fetch_ok,
                         cards_fetched,
                     ) = future.result()
                 except Exception as exc:
                     print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-                    apply_fetched_data(gameid, "", "", None, None, None, None, False, False)
+                    apply_fetched_data(gameid, "", "", None, None, None, None, "", False, False)
                     continue
                 apply_fetched_data(
                     fetched_gameid,
@@ -2134,6 +2198,7 @@ def enrich_events_with_classification(
                     yellow_cards_away,
                     red_cards_home,
                     red_cards_away,
+                    competition_round,
                     fetch_ok,
                     cards_fetched,
                 )
@@ -2612,6 +2677,7 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
         "rank_home",
         "rank_away",
         "first_leg_result",
+        "competition_round",
         "yellow_cards_home",
         "yellow_cards_away",
         "red_cards_home",
@@ -3337,6 +3403,39 @@ def competition_supports_first_leg(event: dict[str, Any]) -> bool:
     return any(hint in league_name for hint in TWO_LEG_COMPETITION_HINTS)
 
 
+def is_knockout_round_segment(text: str) -> bool:
+    normalized = normalize_stat_label(text)
+    if not normalized:
+        return False
+    if "jornada" in normalized:
+        return False
+    if "fase de liga" in normalized or "fase de grupos" in normalized:
+        return False
+    return bool(KNOCKOUT_ROUND_SEGMENT_PATTERN.search(normalized))
+
+
+def extract_competition_round_from_environment(environment: dict[str, Any]) -> str:
+    header_data = environment.get("header", {})
+    if not isinstance(header_data, dict):
+        return ""
+    tournament_data = header_data.get("tournament", {})
+    if not isinstance(tournament_data, dict):
+        return ""
+
+    tournament_text = str(tournament_data.get("tournament", "")).strip()
+    if not tournament_text:
+        return ""
+
+    segments = [segment.strip() for segment in tournament_text.split(" - ") if segment.strip()]
+    if len(segments) <= 1:
+        return ""
+
+    round_segments = [segment for segment in segments[1:] if is_knockout_round_segment(segment)]
+    if not round_segments:
+        return ""
+    return " - ".join(dict.fromkeys(round_segments))
+
+
 def build_scoreline_text(event: dict[str, Any]) -> str:
     team1 = str(event.get("team1", "")).strip()
     team2 = str(event.get("team2", "")).strip()
@@ -3440,6 +3539,7 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
         "rank_home",
         "rank_away",
         "first_leg_result",
+        "competition_round",
         "yellow_cards_home",
         "yellow_cards_away",
         "red_cards_home",
@@ -3640,6 +3740,13 @@ def build_first_leg_description(event: dict[str, Any]) -> str:
     return f"Ida: {first_leg_text}"
 
 
+def build_round_description(event: dict[str, Any]) -> str:
+    round_text = str(event.get("competition_round", "")).strip()
+    if not round_text:
+        return ""
+    return f"Ronda: {round_text}"
+
+
 def build_red_cards_description(event: dict[str, Any]) -> str:
     sport_name = str(event.get("sports", "")).strip().upper()
     if sport_name not in {"FÚTBOL", "FUTBOL"}:
@@ -3707,6 +3814,10 @@ def build_description(event: dict[str, Any]) -> str:
     if first_leg_text:
         description_parts.append(first_leg_text)
 
+    round_text = build_round_description(event)
+    if round_text:
+        description_parts.append(round_text)
+
     yellow_cards_text = build_yellow_cards_description(event)
     if yellow_cards_text:
         description_parts.append(yellow_cards_text)
@@ -3770,7 +3881,7 @@ def should_extend_overrun_event(
     inferred_duration: timedelta,
     now_utc: datetime,
 ) -> bool:
-    if "date_end" in event:
+    if event_timestamp(event, "date_end") > event_timestamp(event, "date"):
         return False
     if event.get("all_day", False):
         return False
@@ -3782,13 +3893,8 @@ def should_extend_overrun_event(
         return False
 
     has_opponent = bool(str(event.get("team2", "")).strip())
-    if not has_opponent:
-        # For individual competitions, a ranking/position means result published.
-        if str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip():
-            return False
-        participant_rankings = event.get("participant_rankings", [])
-        if isinstance(participant_rankings, list) and any(str(item).strip() for item in participant_rankings):
-            return False
+    if not has_opponent and individual_event_has_published_results(event):
+        return False
 
     start_utc = event_datetime_utc(event, "date")
     if start_utc > now_utc:
@@ -3801,23 +3907,50 @@ def should_extend_overrun_event(
     return (now_utc - planned_end_utc) <= timedelta(hours=OVERRUN_EXTENSION_MAX_HOURS)
 
 
+def individual_event_has_published_results(event: dict[str, Any]) -> bool:
+    if str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip():
+        return True
+    result_status = normalize_stat_label(event.get("result_status", ""))
+    if result_status and re.search(r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final)\b", result_status):
+        return True
+    participant_rankings = event.get("participant_rankings", [])
+    if isinstance(participant_rankings, list) and any(str(item).strip() for item in participant_rankings):
+        return True
+    return False
+
+
 def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: str) -> None:
     inferred_duration = infer_duration(name)
-    if "date_end" not in event:
+    start_utc = event_datetime_utc(event, "date")
+    start_ts = event_timestamp(event, "date")
+    end_ts = event_timestamp(event, "date_end")
+    has_valid_date_end = end_ts > start_ts
+
+    if not has_valid_date_end:
         now_utc = datetime.now(tz=UTC)
+        if individual_event_has_published_results(event) and now_utc > start_utc:
+            # If final individual results are already published, close the event immediately.
+            closed_end = min(now_utc, start_utc + inferred_duration)
+            if closed_end > start_utc:
+                calendar_event.end = closed_end
+            else:
+                calendar_event.duration = inferred_duration
+            return
         if should_extend_overrun_event(event, inferred_duration, now_utc):
             calendar_event.end = now_utc + timedelta(minutes=OVERRUN_EXTENSION_MINUTES)
         else:
             calendar_event.duration = inferred_duration
         return
 
-    start = event_datetime_utc(event, "date")
-    end = event_datetime_utc(event, "date_end")
-    duration = end - start
+    end = datetime.fromtimestamp(end_ts, tz=UTC)
+    duration = end - start_utc
 
     if duration.days >= 1:
         if not event.get("all_day", False):
-            calendar_event.duration = timedelta(hours=12)
+            has_opponent = bool(str(event.get("team2", "")).strip())
+            calendar_event.duration = timedelta(hours=12) if has_opponent else inferred_duration
             calendar_event.extra.append(
                 ContentLine(name="RRULE", value=f"FREQ=DAILY;COUNT={duration.days + 1}")
             )
