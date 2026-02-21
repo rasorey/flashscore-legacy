@@ -304,6 +304,7 @@ SOFASCORE_LISTING_FIXTURE_PATTERN = re.compile(
 SOFASCORE_CURL_CFFI_MODULE: Any = None
 SOFASCORE_CURL_CFFI_IMPORT_ATTEMPTED = False
 SOFASCORE_CURL_CFFI_IMPORT_WARNED = False
+CARDS_CACHE_VERSION = 2
 FUTBOLERAS_SEASON_PATTERN = re.compile(r"LIGA-(\d{4})-(\d{4})-", re.IGNORECASE)
 FUTBOLERAS_DATE_TIME_PATTERN = re.compile(
     r"J(?P<journey>\d+)\s+.+?\s+(?P<day>\d{1,2})/(?P<month>\d{1,2})\s+(?P<time>\d{2}:\d{2}|--:--)",
@@ -1723,9 +1724,7 @@ def apply_card_counts_to_event(
 
 
 def apply_cached_cards_to_event(event: dict[str, Any], cache_entry: Any) -> None:
-    if not isinstance(cache_entry, dict):
-        return
-    if not bool(cache_entry.get("cards_fetched", False)):
+    if not cards_cache_is_valid(cache_entry):
         return
 
     apply_card_counts_to_event(
@@ -1743,6 +1742,15 @@ def cache_has_scoreline(cache_entry: Any) -> bool:
     score_home = parse_counter_value(cache_entry.get("score_home"))
     score_away = parse_counter_value(cache_entry.get("score_away"))
     return score_home is not None and score_away is not None
+
+
+def cards_cache_is_valid(cache_entry: Any) -> bool:
+    if not isinstance(cache_entry, dict):
+        return False
+    if not bool(cache_entry.get("cards_fetched", False)):
+        return False
+    cache_version = parse_counter_value(cache_entry.get("cards_cache_version")) or 0
+    return cache_version >= CARDS_CACHE_VERSION
 
 
 def should_fetch_tennis_detail_result(event: dict[str, Any], cache_entry: Any) -> bool:
@@ -2154,8 +2162,9 @@ def enrich_events_with_classification(
         cache_entry = cache_data.get(gameid, {})
         if not isinstance(cache_entry, dict):
             cache_entry = {}
+        valid_cards_cache = cards_cache_is_valid(cache_entry)
 
-        needs_cards_fetch = should_fetch_football_cards(event) and not bool(cache_entry.get("cards_fetched", False))
+        needs_cards_fetch = should_fetch_football_cards(event) and not valid_cards_cache
         needs_round_fetch = should_fetch_competition_round(event) and "competition_round" not in cache_entry
         needs_tennis_result_fetch = should_fetch_tennis_detail_result(event, cache_entry)
 
@@ -2190,8 +2199,9 @@ def enrich_events_with_classification(
             if "competition_round" in cache_entry:
                 updated_cache_entry["competition_round"] = str(cache_entry.get("competition_round", "")).strip()
                 apply_cached_round_to_event(event, updated_cache_entry)
-            if bool(cache_entry.get("cards_fetched", False)):
+            if valid_cards_cache:
                 updated_cache_entry["cards_fetched"] = True
+                updated_cache_entry["cards_cache_version"] = CARDS_CACHE_VERSION
                 updated_cache_entry["yellow_cards_home"] = counter_or_zero(cache_entry.get("yellow_cards_home"))
                 updated_cache_entry["yellow_cards_away"] = counter_or_zero(cache_entry.get("yellow_cards_away"))
                 updated_cache_entry["red_cards_home"] = counter_or_zero(cache_entry.get("red_cards_home"))
@@ -2210,7 +2220,7 @@ def enrich_events_with_classification(
             CLASSIFICATION_REFRESH_EMPTY_CACHE
             and not cached_home_rank
             and not cached_away_rank
-            and not bool(cache_entry.get("cards_fetched", False))
+            and not valid_cards_cache
             and "competition_round" not in cache_entry
             and not cache_has_scoreline(cache_entry)
         ):
@@ -2243,7 +2253,7 @@ def enrich_events_with_classification(
                 apply_classification_to_event(pending_event, cached_home_rank, cached_away_rank)
             applied = True
 
-        if bool(cache_entry.get("cards_fetched", False)):
+        if cards_cache_is_valid(cache_entry):
             for pending_event in events_pending_fetch.get(gameid, []):
                 apply_cached_cards_to_event(pending_event, cache_entry)
             applied = True
@@ -2292,6 +2302,7 @@ def enrich_events_with_classification(
             updated_cache_entry["result_status"] = str(detail_result_status or "").strip()
         if cards_fetched:
             updated_cache_entry["cards_fetched"] = True
+            updated_cache_entry["cards_cache_version"] = CARDS_CACHE_VERSION
             updated_cache_entry["yellow_cards_home"] = counter_or_zero(yellow_cards_home)
             updated_cache_entry["yellow_cards_away"] = counter_or_zero(yellow_cards_away)
             updated_cache_entry["red_cards_home"] = counter_or_zero(red_cards_home)
