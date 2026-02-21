@@ -3028,7 +3028,7 @@ def fetch_motorsport_session_chunks(
         if not tournament_rows:
             continue
         for row_fields, row_blob in tournament_rows:
-            if str(row_fields.get("PX", "")).strip() != participant_id:
+            if not event_matches_participant(row_fields, participant_id):
                 continue
             participant_rows.append((row_fields, row_blob))
 
