@@ -3092,11 +3092,22 @@ def scrape_flashscore_url(
     if session is None:
         session = requests.Session()
     try:
-        try:
-            response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            print(f"Error al acceder a la página {url}: {exc}")
+        response: Optional[requests.Response] = None
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                print(f"Error al acceder a la página {url}: {exc}")
+                return page_events, 0, 0, True
+        if response is None:
+            print(f"Error al acceder a la página {url}: {last_error}")
             return page_events, 0, 0, True
 
         page_html = response.text
