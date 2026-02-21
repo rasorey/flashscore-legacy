@@ -327,6 +327,7 @@ FIRST_LEG_PATTERNS = (
     re.compile(r"first leg[:\s-]*(.+)", re.IGNORECASE),
 )
 SCORE_TEXT_PATTERN = re.compile(r"(\d+)\s*[-:–]\s*(\d+)")
+STATUS_SCORE_PATTERN = re.compile(r"(?<!\d)(\d{1,3})\s*[-:–]\s*(\d{1,3})(?!\d)")
 TWO_LEG_COMPETITION_HINTS = (
     "COPA",
     "PLAYOFF",
@@ -2508,6 +2509,69 @@ def result_status_is_final(value: Any) -> bool:
     return bool(re.search(r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final)\b", status))
 
 
+def extract_scores_from_result_status(
+    result_status: Any,
+    stage_code: Any,
+) -> tuple[Optional[int], Optional[int]]:
+    status_text = str(result_status or "").strip()
+    if not status_text:
+        return None, None
+
+    stage_value = parse_stage_code(stage_code)
+    is_finished = stage_value == 3 or result_status_is_final(status_text)
+    if not is_finished:
+        return None, None
+
+    for match in STATUS_SCORE_PATTERN.finditer(status_text):
+        score_home = int(match.group(1))
+        score_away = int(match.group(2))
+        if score_home > 300 or score_away > 300:
+            continue
+        return score_home, score_away
+
+    return None, None
+
+
+def extract_event_scoreline(event: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    score_home = parse_counter_value(event.get("score_home"))
+    score_away = parse_counter_value(event.get("score_away"))
+    if score_home is None or score_away is None:
+        return None, None
+    return score_home, score_away
+
+
+def should_replace_scoreline(existing_event: dict[str, Any], incoming_event: dict[str, Any]) -> bool:
+    incoming_score_home, incoming_score_away = extract_event_scoreline(incoming_event)
+    if incoming_score_home is None or incoming_score_away is None:
+        return False
+
+    existing_score_home, existing_score_away = extract_event_scoreline(existing_event)
+    if existing_score_home is None or existing_score_away is None:
+        return True
+
+    incoming_scoreline = (incoming_score_home, incoming_score_away)
+    existing_scoreline = (existing_score_home, existing_score_away)
+    if incoming_scoreline == existing_scoreline:
+        return False
+
+    incoming_stage = parse_stage_code(incoming_event.get("event_stage_code", ""))
+    existing_stage = parse_stage_code(existing_event.get("event_stage_code", ""))
+    if incoming_stage is not None and (existing_stage is None or incoming_stage > existing_stage):
+        return True
+
+    if event_timestamp(incoming_event, "date_end") > event_timestamp(existing_event, "date_end"):
+        return True
+    if event_timestamp(incoming_event, "date_updated") > event_timestamp(existing_event, "date_updated"):
+        return True
+
+    if result_status_is_final(incoming_event.get("result_status", "")) and not result_status_is_final(
+        existing_event.get("result_status", "")
+    ):
+        return True
+
+    return False
+
+
 def extract_first_leg_from_text(text: str) -> str:
     raw_text = str(text).strip()
     if not raw_text:
@@ -2655,6 +2719,10 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
     if stage_code.isdigit():
         event["event_stage_code"] = stage_code
 
+    result_status = extract_result_status(fields)
+    if result_status:
+        event["result_status"] = result_status
+
     date_updated_raw = str(fields.get("AO", "")).strip()
     if date_updated_raw.isdigit():
         date_updated_ts = int(date_updated_raw)
@@ -2674,6 +2742,8 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         event["date_end"] = date_end_ts
 
     score_home, score_away = extract_scores(fields)
+    if score_home is None or score_away is None:
+        score_home, score_away = extract_scores_from_result_status(result_status, stage_code)
     if score_home is not None and score_away is not None:
         event["score_home"] = score_home
         event["score_away"] = score_away
@@ -2683,10 +2753,6 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         event["red_cards_home"] = red_cards_home
     if red_cards_away is not None and red_cards_away > 0:
         event["red_cards_away"] = red_cards_away
-
-    result_status = extract_result_status(fields)
-    if result_status:
-        event["result_status"] = result_status
 
     first_leg_result = extract_first_leg_from_fields(fields)
     if not first_leg_result and result_status:
@@ -2703,6 +2769,7 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
 
 def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str, Any]) -> dict[str, Any]:
     merged = existing_event.copy()
+    replace_scoreline = should_replace_scoreline(existing_event, incoming_event)
 
     for key in (
         "league",
@@ -2742,10 +2809,11 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
     if incoming_updated_ts > event_timestamp(merged, "date_updated"):
         merged["date_updated"] = incoming_updated_ts
 
-    if "score_home" not in merged and "score_home" in incoming_event:
-        merged["score_home"] = incoming_event["score_home"]
-    if "score_away" not in merged and "score_away" in incoming_event:
-        merged["score_away"] = incoming_event["score_away"]
+    if replace_scoreline:
+        incoming_score_home, incoming_score_away = extract_event_scoreline(incoming_event)
+        if incoming_score_home is not None and incoming_score_away is not None:
+            merged["score_home"] = incoming_score_home
+            merged["score_away"] = incoming_score_away
 
     existing_tv = merged.get("tv", [])
     incoming_tv = incoming_event.get("tv", [])
@@ -3695,6 +3763,7 @@ def update_obsolete_links(gamelist: dict[str, dict[str, Any]], obsolete_file: Pa
 
 def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[str, Any]) -> dict[str, Any]:
     enriched = event.copy()
+    replace_scoreline = should_replace_scoreline(event, existing_event)
 
     if not normalize_league(enriched.get("league", "")):
         existing_league = normalize_league(existing_event.get("league", ""))
@@ -3704,8 +3773,6 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
     for key in (
         "team1",
         "team2",
-        "result_status",
-        "event_stage_code",
         "url",
         "rank_home",
         "rank_away",
@@ -3719,16 +3786,32 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
         if not str(enriched.get(key, "")).strip() and str(existing_event.get(key, "")).strip():
             enriched[key] = existing_event[key]
 
-    if "date_end" not in enriched and "date_end" in existing_event:
-        enriched["date_end"] = existing_event["date_end"]
+    existing_status = str(existing_event.get("result_status", "")).strip()
+    current_status = str(enriched.get("result_status", "")).strip()
+    if existing_status and (
+        not current_status
+        or (result_status_is_final(existing_status) and not result_status_is_final(current_status))
+    ):
+        enriched["result_status"] = existing_status
+
+    existing_stage = parse_stage_code(existing_event.get("event_stage_code", ""))
+    current_stage = parse_stage_code(enriched.get("event_stage_code", ""))
+    if existing_stage is not None and (current_stage is None or existing_stage > current_stage):
+        enriched["event_stage_code"] = str(existing_stage)
+
+    existing_date_end_ts = event_timestamp(existing_event, "date_end")
+    if existing_date_end_ts > event_timestamp(enriched, "date_end"):
+        enriched["date_end"] = existing_date_end_ts
+
     existing_updated_ts = event_timestamp(existing_event, "date_updated")
     if existing_updated_ts > event_timestamp(enriched, "date_updated"):
         enriched["date_updated"] = existing_updated_ts
 
-    if "score_home" not in enriched and "score_home" in existing_event:
-        enriched["score_home"] = existing_event["score_home"]
-    if "score_away" not in enriched and "score_away" in existing_event:
-        enriched["score_away"] = existing_event["score_away"]
+    if replace_scoreline:
+        existing_score_home, existing_score_away = extract_event_scoreline(existing_event)
+        if existing_score_home is not None and existing_score_away is not None:
+            enriched["score_home"] = existing_score_home
+            enriched["score_away"] = existing_score_away
 
     current_tv = enriched.get("tv", [])
     existing_tv = existing_event.get("tv", [])

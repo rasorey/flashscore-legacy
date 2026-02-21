@@ -81,4 +81,5 @@ Por defecto los archivos se escriben en `/var/www/html`:
 
 - La fusión de eventos de golf consolida jugadores por competición y elimina duplicados de nombres (normalizando mayúsculas, acentos y espacios).
 - En competiciones individuales se añade `participant_rankings` cuando hay datos de ranking.
+- En deportes con dos equipos (p. ej. fútbol sala, baloncesto, balonmano y similares), el título del evento muestra el marcador cuando está disponible; además se conserva la mejor versión del resultado al fusionar actualizaciones.
 - En partidos de fútbol se añaden tarjetas al evento: expulsiones desde `AJ/AK` y amarillas desde el feed de estadísticas (`df_st_*`), mostrando iconos junto al nombre del equipo en el título (`🟨`, `🟥`) y resumen en la descripción.
