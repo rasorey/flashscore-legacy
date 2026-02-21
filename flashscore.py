@@ -2494,6 +2494,20 @@ def normalize_score_text(value: str) -> str:
     return normalized.strip(" .;|")
 
 
+def parse_stage_code(value: Any) -> Optional[int]:
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+def result_status_is_final(value: Any) -> bool:
+    status = normalize_stat_label(value)
+    if not status:
+        return False
+    return bool(re.search(r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final)\b", status))
+
+
 def extract_first_leg_from_text(text: str) -> str:
     raw_text = str(text).strip()
     if not raw_text:
@@ -2694,8 +2708,6 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
         "league",
         "team1",
         "team2",
-        "result_status",
-        "event_stage_code",
         "url",
         "rank_home",
         "rank_away",
@@ -2709,8 +2721,23 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
         if not str(merged.get(key, "")).strip() and str(incoming_event.get(key, "")).strip():
             merged[key] = incoming_event[key]
 
-    if "date_end" not in merged and "date_end" in incoming_event:
-        merged["date_end"] = incoming_event["date_end"]
+    existing_status = str(merged.get("result_status", "")).strip()
+    incoming_status = str(incoming_event.get("result_status", "")).strip()
+    if incoming_status and (
+        not existing_status
+        or (result_status_is_final(incoming_status) and not result_status_is_final(existing_status))
+    ):
+        merged["result_status"] = incoming_status
+
+    existing_stage = parse_stage_code(merged.get("event_stage_code", ""))
+    incoming_stage = parse_stage_code(incoming_event.get("event_stage_code", ""))
+    if incoming_stage is not None and (existing_stage is None or incoming_stage > existing_stage):
+        merged["event_stage_code"] = str(incoming_stage)
+
+    incoming_date_end_ts = event_timestamp(incoming_event, "date_end")
+    if incoming_date_end_ts > event_timestamp(merged, "date_end"):
+        merged["date_end"] = incoming_date_end_ts
+
     incoming_updated_ts = event_timestamp(incoming_event, "date_updated")
     if incoming_updated_ts > event_timestamp(merged, "date_updated"):
         merged["date_updated"] = incoming_updated_ts
