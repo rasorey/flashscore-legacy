@@ -4000,6 +4000,13 @@ def should_extend_overrun_event(
     if sport_name not in OVERRUN_EXTENSION_SPORTS:
         return False
 
+    league_name = normalize_league(event.get("league", "")).upper()
+    stage_code = str(event.get("event_stage_code", "")).strip()
+    # Cycling stages often carry stale/non-final state codes for a while in feeds.
+    # To avoid leaving finished stages as "in progress", only extend when explicitly live.
+    if sport_name == "CICLISMO" and "ETAPA" in league_name and stage_code != "2":
+        return False
+
     has_opponent = bool(str(event.get("team2", "")).strip())
     if not has_opponent and individual_event_has_published_results(event):
         return False
