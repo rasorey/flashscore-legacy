@@ -2637,6 +2637,16 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         "url": "",
     }
 
+    stage_code = str(fields.get("AB", "")).strip()
+    if stage_code.isdigit():
+        event["event_stage_code"] = stage_code
+
+    date_updated_raw = str(fields.get("AO", "")).strip()
+    if date_updated_raw.isdigit():
+        date_updated_ts = int(date_updated_raw)
+        if date_updated_ts >= int(timestamp_raw):
+            event["date_updated"] = date_updated_ts
+
     team2 = fields.get("AF")
     if team2:
         event["team2"] = team2
@@ -2685,6 +2695,7 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
         "team1",
         "team2",
         "result_status",
+        "event_stage_code",
         "url",
         "rank_home",
         "rank_away",
@@ -2700,6 +2711,9 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
 
     if "date_end" not in merged and "date_end" in incoming_event:
         merged["date_end"] = incoming_event["date_end"]
+    incoming_updated_ts = event_timestamp(incoming_event, "date_updated")
+    if incoming_updated_ts > event_timestamp(merged, "date_updated"):
+        merged["date_updated"] = incoming_updated_ts
 
     if "score_home" not in merged and "score_home" in incoming_event:
         merged["score_home"] = incoming_event["score_home"]
@@ -2773,7 +2787,7 @@ def event_matches_participant(fields: dict[str, str], participant_id: str) -> bo
             continue
         if candidate == participant_id:
             return True
-        tokens = [token for token in re.split(r"[\\s/|,;]+", candidate) if token]
+        tokens = [token for token in re.split(r"[\s/|,;]+", candidate) if token]
         if participant_id in tokens:
             return True
 
@@ -3283,6 +3297,11 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
             golf_merged[first_game_id]["team1"].extend(split_participant_names(event.get("team1", "")))
             if participant_name and participant_rank:
                 golf_merged[first_game_id]["participant_rankings"].append(f"{participant_name} ({participant_rank})")
+            if str(event.get("event_stage_code", "")).strip() == "3":
+                golf_merged[first_game_id]["event_stage_code"] = "3"
+            updated_ts = event_timestamp(event, "date_updated")
+            if updated_ts > event_timestamp(golf_merged[first_game_id], "date_updated"):
+                golf_merged[first_game_id]["date_updated"] = updated_ts
             keys_to_remove.append(game_id)
             continue
 
@@ -3391,6 +3410,8 @@ def merge_individual_competition_events(gamelist: dict[str, dict[str, Any]]) -> 
         participant_rankings: list[str] = []
         merged_tv_channels: list[str] = []
         statuses: list[str] = []
+        max_date_updated = event_timestamp(merged_event, "date_updated")
+        has_finished_stage_code = str(merged_event.get("event_stage_code", "")).strip() == "3"
 
         for _event_id, event in grouped_list:
             participant_name = str(event.get("team1", "")).strip()
@@ -3414,6 +3435,10 @@ def merge_individual_competition_events(gamelist: dict[str, dict[str, Any]]) -> 
             if status:
                 statuses.append(status)
 
+            if str(event.get("event_stage_code", "")).strip() == "3":
+                has_finished_stage_code = True
+            max_date_updated = max(max_date_updated, event_timestamp(event, "date_updated"))
+
         if participant_names:
             merged_event["team1"] = "/".join(participant_names)
         merged_event.pop("team2", None)
@@ -3433,6 +3458,16 @@ def merge_individual_competition_events(gamelist: dict[str, dict[str, Any]]) -> 
             merged_event["status"] = "CANCELLED"
         else:
             merged_event["status"] = "CONFIRMED"
+
+        if has_finished_stage_code:
+            merged_event["event_stage_code"] = "3"
+        elif "event_stage_code" in merged_event:
+            merged_event.pop("event_stage_code", None)
+
+        if max_date_updated > 0:
+            merged_event["date_updated"] = max_date_updated
+        else:
+            merged_event.pop("date_updated", None)
 
         for game_id, _event in grouped_list[1:]:
             gamelist.pop(game_id, None)
@@ -3604,6 +3639,7 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
         "team1",
         "team2",
         "result_status",
+        "event_stage_code",
         "url",
         "rank_home",
         "rank_away",
@@ -3619,6 +3655,9 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
 
     if "date_end" not in enriched and "date_end" in existing_event:
         enriched["date_end"] = existing_event["date_end"]
+    existing_updated_ts = event_timestamp(existing_event, "date_updated")
+    if existing_updated_ts > event_timestamp(enriched, "date_updated"):
+        enriched["date_updated"] = existing_updated_ts
 
     if "score_home" not in enriched and "score_home" in existing_event:
         enriched["score_home"] = existing_event["score_home"]
@@ -3979,6 +4018,8 @@ def should_extend_overrun_event(
 def individual_event_has_published_results(event: dict[str, Any]) -> bool:
     if str(event.get("team2", "")).strip():
         return False
+    if str(event.get("event_stage_code", "")).strip() == "3":
+        return True
     if str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip():
         return True
     result_status = normalize_stat_label(event.get("result_status", ""))
@@ -3988,6 +4029,29 @@ def individual_event_has_published_results(event: dict[str, Any]) -> bool:
     if isinstance(participant_rankings, list) and any(str(item).strip() for item in participant_rankings):
         return True
     return False
+
+
+def infer_multiday_individual_duration(
+    event: dict[str, Any],
+    start_utc: datetime,
+    inferred_duration: timedelta,
+) -> timedelta:
+    stage_code = str(event.get("event_stage_code", "")).strip()
+    updated_ts = event_timestamp(event, "date_updated")
+    if stage_code == "3" and updated_ts > event_timestamp(event, "date"):
+        updated_utc = datetime.fromtimestamp(updated_ts, tz=UTC)
+        day_offset = max(0, (updated_utc.date() - start_utc.date()).days)
+        day_start_utc = start_utc + timedelta(days=day_offset)
+        dynamic_duration = updated_utc - day_start_utc
+        if timedelta(minutes=45) <= dynamic_duration <= timedelta(hours=18):
+            return dynamic_duration
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name == "GOLF":
+        return timedelta(hours=8)
+    if sport_name == "CICLISMO" and stage_code == "3":
+        return timedelta(hours=5)
+    return inferred_duration
 
 
 def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: str) -> None:
@@ -4019,11 +4083,10 @@ def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: st
     if duration.days >= 1:
         if not event.get("all_day", False):
             has_opponent = bool(str(event.get("team2", "")).strip())
-            sport_name = str(event.get("sports", "")).strip().upper()
-            if has_opponent or sport_name == "GOLF":
+            if has_opponent:
                 calendar_event.duration = timedelta(hours=12)
             else:
-                calendar_event.duration = inferred_duration
+                calendar_event.duration = infer_multiday_individual_duration(event, start_utc, inferred_duration)
             calendar_event.extra.append(
                 ContentLine(name="RRULE", value=f"FREQ=DAILY;COUNT={duration.days + 1}")
             )
