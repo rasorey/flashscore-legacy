@@ -3994,7 +3994,11 @@ def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: st
     if duration.days >= 1:
         if not event.get("all_day", False):
             has_opponent = bool(str(event.get("team2", "")).strip())
-            calendar_event.duration = timedelta(hours=12) if has_opponent else inferred_duration
+            sport_name = str(event.get("sports", "")).strip().upper()
+            if has_opponent or sport_name == "GOLF":
+                calendar_event.duration = timedelta(hours=12)
+            else:
+                calendar_event.duration = inferred_duration
             calendar_event.extra.append(
                 ContentLine(name="RRULE", value=f"FREQ=DAILY;COUNT={duration.days + 1}")
             )
