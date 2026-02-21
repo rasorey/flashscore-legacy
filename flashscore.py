@@ -1737,6 +1737,143 @@ def apply_cached_cards_to_event(event: dict[str, Any], cache_entry: Any) -> None
     )
 
 
+def cache_has_scoreline(cache_entry: Any) -> bool:
+    if not isinstance(cache_entry, dict):
+        return False
+    score_home = parse_counter_value(cache_entry.get("score_home"))
+    score_away = parse_counter_value(cache_entry.get("score_away"))
+    return score_home is not None and score_away is not None
+
+
+def should_fetch_tennis_detail_result(event: dict[str, Any], cache_entry: Any) -> bool:
+    if str(event.get("sports", "")).strip().upper() != "TENIS":
+        return False
+    if not str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
+        return False
+    if parse_counter_value(event.get("score_home")) is not None and parse_counter_value(event.get("score_away")) is not None:
+        return False
+    if cache_has_scoreline(cache_entry):
+        return False
+
+    stage_code = parse_stage_code(event.get("event_stage_code", ""))
+    if stage_code == 3:
+        return True
+    return result_status_is_final(event.get("result_status", ""))
+
+
+def apply_result_data_to_event(
+    event: dict[str, Any],
+    score_home: Optional[int],
+    score_away: Optional[int],
+    result_status: Any,
+) -> bool:
+    updated = False
+
+    if score_home is not None and score_away is not None:
+        incoming_event: dict[str, Any] = {
+            "score_home": int(score_home),
+            "score_away": int(score_away),
+            "event_stage_code": str(event.get("event_stage_code", "")).strip(),
+            "result_status": str(result_status or "").strip(),
+        }
+        if should_replace_scoreline(event, incoming_event):
+            event["score_home"] = int(score_home)
+            event["score_away"] = int(score_away)
+            updated = True
+
+    previous_status = str(event.get("result_status", "")).strip()
+    apply_result_status_to_event(event, result_status)
+    if str(event.get("result_status", "")).strip() != previous_status:
+        updated = True
+
+    return updated
+
+
+def apply_cached_result_data_to_event(event: dict[str, Any], cache_entry: Any) -> bool:
+    if not isinstance(cache_entry, dict):
+        return False
+    score_home = parse_counter_value(cache_entry.get("score_home"))
+    score_away = parse_counter_value(cache_entry.get("score_away"))
+    result_status = cache_entry.get("result_status", "")
+    return apply_result_data_to_event(event, score_home, score_away, result_status)
+
+
+def stage_translation_from_environment(environment: dict[str, Any], stage_code_raw: Any) -> str:
+    stage_code = parse_stage_code(stage_code_raw)
+    if stage_code is None:
+        return ""
+
+    translations = environment.get("eventStageTranslations", {})
+    if not isinstance(translations, dict):
+        return ""
+
+    translation = translations.get(str(stage_code))
+    if translation is None:
+        translation = translations.get(stage_code)
+    text = str(translation or "").strip().replace("&nbsp;", " ").strip()
+    return text
+
+
+def extract_stage_code_from_common_feed(payload: str) -> str:
+    if not payload:
+        return ""
+    fields = parse_event_fields(payload if payload.endswith("¬") else f"{payload}¬")
+    for key in ("DB", "DZ", "DL"):
+        value = str(fields.get(key, "")).strip()
+        if value.isdigit():
+            return value
+    return ""
+
+
+def extract_tennis_score_from_summary_feed(payload: str) -> tuple[Optional[int], Optional[int]]:
+    if not payload:
+        return None, None
+    for row_blob in normalize_feed_payload(payload).split("¬~"):
+        if not row_blob:
+            continue
+        fields = parse_event_fields(row_blob if row_blob.endswith("¬") else f"{row_blob}¬")
+        score_home, score_away = extract_scores(fields)
+        if score_home is not None and score_away is not None:
+            return score_home, score_away
+    return None, None
+
+
+def fetch_tennis_detail_result(
+    session: requests.Session,
+    gameid: str,
+    page_url: str,
+    page_html: str,
+    environment: dict[str, Any],
+) -> tuple[Optional[int], Optional[int], str]:
+    if str(environment.get("sport", "")).strip().lower() != "tennis":
+        return None, None, ""
+
+    project_id = extract_project_id_from_environment_data(environment, page_html)
+    feed_sign = extract_feed_sign_from_page_html(page_html)
+    if not feed_sign:
+        soup = BeautifulSoup(page_html, "html.parser")
+        core_script_url, _core_project_id = extract_core_script_context(soup, page_url)
+        feed_sign = extract_feed_sign(session, core_script_url)
+    if not project_id or not feed_sign:
+        return None, None, ""
+
+    summary_payload = fetch_feed_payload(session, project_id, f"df_sur_1_{gameid}", feed_sign)
+    score_home, score_away = extract_tennis_score_from_summary_feed(summary_payload)
+
+    common_payload = fetch_feed_payload(session, project_id, f"dc_1_{gameid}", feed_sign)
+    stage_code = extract_stage_code_from_common_feed(common_payload)
+    result_status = stage_translation_from_environment(environment, stage_code)
+    if result_status and result_status.strip() == "-":
+        result_status = ""
+
+    if not result_status and score_home is not None and score_away is not None:
+        result_status = "Finalizado"
+
+    return score_home, score_away, result_status
+
+
 def fetch_event_cards_from_statistics(
     session: requests.Session,
     gameid: str,
@@ -1854,9 +1991,22 @@ def fallback_team_ranks_from_standings(
 def fetch_event_classification(
     session: requests.Session,
     gameid: str,
-) -> tuple[str, str, Optional[int], Optional[int], Optional[int], Optional[int], str, bool, bool]:
+) -> tuple[
+    str,
+    str,
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    str,
+    Optional[int],
+    Optional[int],
+    str,
+    bool,
+    bool,
+]:
     if not gameid:
-        return "", "", None, None, None, None, "", False, False
+        return "", "", None, None, None, None, "", None, None, "", False, False
 
     url = MATCH_DETAIL_URL_TEMPLATE.format(gameid=gameid)
     response = None
@@ -1872,21 +2022,28 @@ def fetch_event_classification(
                 time.sleep(0.2)
                 continue
             print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-            return "", "", None, None, None, None, "", False, False
+            return "", "", None, None, None, None, "", None, None, "", False, False
 
     if response is None:
         if last_error is not None:
             print(f"No se pudo obtener clasificación para {gameid}: {last_error}")
-        return "", "", None, None, None, None, "", False, False
+        return "", "", None, None, None, None, "", None, None, "", False, False
 
     environment = extract_environment_data(response.text)
     if not environment:
-        return "", "", None, None, None, None, "", False, False
+        return "", "", None, None, None, None, "", None, None, "", False, False
 
     competition_round = extract_competition_round_from_environment(environment)
 
     yellow_cards_home, yellow_cards_away, red_cards_home, red_cards_away, cards_fetched = (
         fetch_event_cards_from_statistics(session, gameid, url, response.text, environment)
+    )
+    detail_score_home, detail_score_away, detail_result_status = fetch_tennis_detail_result(
+        session,
+        gameid,
+        url,
+        response.text,
+        environment,
     )
 
     participants_data = environment.get("participantsData", {})
@@ -1907,6 +2064,9 @@ def fetch_event_classification(
             red_cards_home,
             red_cards_away,
             competition_round,
+            detail_score_home,
+            detail_score_away,
+            detail_result_status,
             True,
             cards_fetched,
         )
@@ -1932,6 +2092,9 @@ def fetch_event_classification(
         red_cards_home,
         red_cards_away,
         competition_round,
+        detail_score_home,
+        detail_score_away,
+        detail_result_status,
         True,
         cards_fetched,
     )
@@ -1993,12 +2156,14 @@ def enrich_events_with_classification(
 
         needs_cards_fetch = should_fetch_football_cards(event) and not bool(cache_entry.get("cards_fetched", False))
         needs_round_fetch = should_fetch_competition_round(event) and "competition_round" not in cache_entry
+        needs_tennis_result_fetch = should_fetch_tennis_detail_result(event, cache_entry)
 
         if (
             CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT
             and event_has_sufficient_rank_data(event)
             and not needs_cards_fetch
             and not needs_round_fetch
+            and not needs_tennis_result_fetch
         ):
             current_home_rank = str(event.get("rank_home", "")).strip()
             current_away_rank = str(event.get("rank_away", "")).strip()
@@ -2007,6 +2172,20 @@ def enrich_events_with_classification(
                 "rank_away": current_away_rank,
                 "fetched_at": now_timestamp,
             }
+            current_score_home = parse_counter_value(event.get("score_home"))
+            current_score_away = parse_counter_value(event.get("score_away"))
+            if current_score_home is not None and current_score_away is not None:
+                updated_cache_entry["score_home"] = current_score_home
+                updated_cache_entry["score_away"] = current_score_away
+            elif cache_has_scoreline(cache_entry):
+                updated_cache_entry["score_home"] = parse_counter_value(cache_entry.get("score_home"))
+                updated_cache_entry["score_away"] = parse_counter_value(cache_entry.get("score_away"))
+            current_result_status = str(event.get("result_status", "")).strip()
+            if current_result_status:
+                updated_cache_entry["result_status"] = current_result_status
+            elif str(cache_entry.get("result_status", "")).strip():
+                updated_cache_entry["result_status"] = str(cache_entry.get("result_status", "")).strip()
+
             if "competition_round" in cache_entry:
                 updated_cache_entry["competition_round"] = str(cache_entry.get("competition_round", "")).strip()
                 apply_cached_round_to_event(event, updated_cache_entry)
@@ -2017,6 +2196,7 @@ def enrich_events_with_classification(
                 updated_cache_entry["red_cards_home"] = counter_or_zero(cache_entry.get("red_cards_home"))
                 updated_cache_entry["red_cards_away"] = counter_or_zero(cache_entry.get("red_cards_away"))
                 apply_cached_cards_to_event(event, updated_cache_entry)
+            apply_cached_result_data_to_event(event, updated_cache_entry)
             cache_data[gameid] = updated_cache_entry
             continue
 
@@ -2031,13 +2211,15 @@ def enrich_events_with_classification(
             and not cached_away_rank
             and not bool(cache_entry.get("cards_fetched", False))
             and "competition_round" not in cache_entry
+            and not cache_has_scoreline(cache_entry)
         ):
             is_fresh = False
 
-        if is_fresh and not needs_cards_fetch and not needs_round_fetch:
+        if is_fresh and not needs_cards_fetch and not needs_round_fetch and not needs_tennis_result_fetch:
             apply_classification_to_event(event, cached_home_rank, cached_away_rank)
             apply_cached_cards_to_event(event, cache_entry)
             apply_cached_round_to_event(event, cache_entry)
+            apply_cached_result_data_to_event(event, cache_entry)
             continue
 
         events_pending_fetch.setdefault(gameid, []).append(event)
@@ -2070,6 +2252,10 @@ def enrich_events_with_classification(
                 apply_cached_round_to_event(pending_event, cache_entry)
             applied = True
 
+        for pending_event in events_pending_fetch.get(gameid, []):
+            if apply_cached_result_data_to_event(pending_event, cache_entry):
+                applied = True
+
         return applied
 
     def apply_fetched_data(
@@ -2081,6 +2267,9 @@ def enrich_events_with_classification(
         red_cards_home: Optional[int],
         red_cards_away: Optional[int],
         competition_round: str,
+        detail_score_home: Optional[int],
+        detail_score_away: Optional[int],
+        detail_result_status: str,
         fetch_ok: bool,
         cards_fetched: bool,
     ) -> None:
@@ -2095,6 +2284,11 @@ def enrich_events_with_classification(
         updated_cache_entry["rank_away"] = rank_away
         updated_cache_entry["fetched_at"] = now_timestamp
         updated_cache_entry["competition_round"] = str(competition_round or "").strip()
+        if detail_score_home is not None and detail_score_away is not None:
+            updated_cache_entry["score_home"] = int(detail_score_home)
+            updated_cache_entry["score_away"] = int(detail_score_away)
+        if str(detail_result_status or "").strip():
+            updated_cache_entry["result_status"] = str(detail_result_status or "").strip()
         if cards_fetched:
             updated_cache_entry["cards_fetched"] = True
             updated_cache_entry["yellow_cards_home"] = counter_or_zero(yellow_cards_home)
@@ -2116,6 +2310,15 @@ def enrich_events_with_classification(
             else:
                 apply_cached_cards_to_event(pending_event, updated_cache_entry)
             apply_competition_round_to_event(pending_event, competition_round)
+            if detail_score_home is not None and detail_score_away is not None:
+                apply_result_data_to_event(
+                    pending_event,
+                    detail_score_home,
+                    detail_score_away,
+                    detail_result_status,
+                )
+            else:
+                apply_cached_result_data_to_event(pending_event, updated_cache_entry)
 
     max_workers = min(CLASSIFICATION_MAX_WORKERS, len(gameids_to_fetch))
     if max_workers <= 1:
@@ -2129,6 +2332,9 @@ def enrich_events_with_classification(
                     red_cards_home,
                     red_cards_away,
                     competition_round,
+                    detail_score_home,
+                    detail_score_away,
+                    detail_result_status,
                     fetch_ok,
                     cards_fetched,
                 ) = fetch_event_classification(session, gameid)
@@ -2141,6 +2347,9 @@ def enrich_events_with_classification(
                     red_cards_home,
                     red_cards_away,
                     competition_round,
+                    detail_score_home,
+                    detail_score_away,
+                    detail_result_status,
                     fetch_ok,
                     cards_fetched,
                 )
@@ -2151,7 +2360,21 @@ def enrich_events_with_classification(
 
         def fetch_worker(
             gameid: str,
-        ) -> tuple[str, str, str, Optional[int], Optional[int], Optional[int], Optional[int], str, bool, bool]:
+        ) -> tuple[
+            str,
+            str,
+            str,
+            Optional[int],
+            Optional[int],
+            Optional[int],
+            Optional[int],
+            str,
+            Optional[int],
+            Optional[int],
+            str,
+            bool,
+            bool,
+        ]:
             session = getattr(thread_local_session, "session", None)
             if session is None:
                 session = requests.Session()
@@ -2166,6 +2389,9 @@ def enrich_events_with_classification(
                 red_cards_home,
                 red_cards_away,
                 competition_round,
+                detail_score_home,
+                detail_score_away,
+                detail_result_status,
                 fetch_ok,
                 cards_fetched,
             ) = fetch_event_classification(session, gameid)
@@ -2178,6 +2404,9 @@ def enrich_events_with_classification(
                 red_cards_home,
                 red_cards_away,
                 competition_round,
+                detail_score_home,
+                detail_score_away,
+                detail_result_status,
                 fetch_ok,
                 cards_fetched,
             )
@@ -2196,12 +2425,15 @@ def enrich_events_with_classification(
                         red_cards_home,
                         red_cards_away,
                         competition_round,
+                        detail_score_home,
+                        detail_score_away,
+                        detail_result_status,
                         fetch_ok,
                         cards_fetched,
                     ) = future.result()
                 except Exception as exc:
                     print(f"No se pudo obtener clasificación para {gameid}: {exc}")
-                    apply_fetched_data(gameid, "", "", None, None, None, None, "", False, False)
+                    apply_fetched_data(gameid, "", "", None, None, None, None, "", None, None, "", False, False)
                     continue
                 apply_fetched_data(
                     fetched_gameid,
@@ -2212,6 +2444,9 @@ def enrich_events_with_classification(
                     red_cards_home,
                     red_cards_away,
                     competition_round,
+                    detail_score_home,
+                    detail_score_away,
+                    detail_result_status,
                     fetch_ok,
                     cards_fetched,
                 )
@@ -2506,7 +2741,34 @@ def result_status_is_final(value: Any) -> bool:
     status = normalize_stat_label(value)
     if not status:
         return False
-    return bool(re.search(r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final)\b", status))
+    return bool(
+        re.search(
+            r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final|walkover|w/o|retirad[oa]?|retired|forfeit)\b",
+            status,
+        )
+    )
+
+
+def result_status_is_terminal(value: Any) -> bool:
+    status = normalize_stat_label(value)
+    if not status:
+        return False
+    return bool(
+        re.search(
+            r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final|walkover|w/o|retirad[oa]?|retired|forfeit|anulad[oa]?|cancel(?:led|ado)?|aplazad[oa]?|postponed|suspendid[oa]?|abandonad[oa]?|por perdido)\b",
+            status,
+        )
+    )
+
+
+def apply_result_status_to_event(event: dict[str, Any], result_status: Any) -> None:
+    incoming_status = str(result_status or "").strip()
+    if not incoming_status:
+        return
+
+    current_status = str(event.get("result_status", "")).strip()
+    if not current_status or (result_status_is_final(incoming_status) and not result_status_is_final(current_status)):
+        event["result_status"] = incoming_status
 
 
 def extract_scores_from_result_status(
@@ -3933,6 +4195,9 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
             name += team1
         if team2:
             name += f" \u2013 {team2}"
+        result_status = str(event.get("result_status", "")).strip()
+        if team1 and team2 and result_status and result_status_is_terminal(result_status):
+            name += f" ({result_status})"
 
     league = competition_override(event)
     if not league:
