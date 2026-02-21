@@ -2763,8 +2763,22 @@ def event_matches_participant(fields: dict[str, str], participant_id: str) -> bo
     if not participant_id:
         return True
 
-    row_participant_id = str(fields.get("PX", "")).strip()
-    if row_participant_id and row_participant_id != participant_id:
+    candidate_values = [
+        str(fields.get("PX", "")).strip(),
+        str(fields.get("PY", "")).strip(),
+    ]
+
+    for candidate in candidate_values:
+        if not candidate:
+            continue
+        if candidate == participant_id:
+            return True
+        tokens = [token for token in re.split(r"[\\s/|,;]+", candidate) if token]
+        if participant_id in tokens:
+            return True
+
+    # If participant id fields exist but none matches, this row belongs to another athlete/team.
+    if any(candidate_values):
         return False
     return True
 
