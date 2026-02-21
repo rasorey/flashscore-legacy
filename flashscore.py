@@ -3483,6 +3483,45 @@ def merge_individual_competition_events(gamelist: dict[str, dict[str, Any]]) -> 
         )
 
 
+def remove_redundant_cycling_general_events(gamelist: dict[str, dict[str, Any]]) -> None:
+    stage_base_keys: set[str] = set()
+
+    for event in gamelist.values():
+        if str(event.get("sports", "")).strip().upper() != "CICLISMO":
+            continue
+        if str(event.get("team2", "")).strip():
+            continue
+
+        league_name = normalize_league(event.get("league", ""))
+        stage_match = re.match(r"^(.*)\s-\sEtapa\s+\d+\s*$", league_name, flags=re.IGNORECASE)
+        if not stage_match:
+            continue
+        stage_base = stage_match.group(1).strip().upper()
+        if stage_base:
+            stage_base_keys.add(stage_base)
+
+    if not stage_base_keys:
+        return
+
+    keys_to_remove: list[str] = []
+    for game_id, event in gamelist.items():
+        if str(event.get("sports", "")).strip().upper() != "CICLISMO":
+            continue
+        if str(event.get("team2", "")).strip():
+            continue
+
+        league_name = normalize_league(event.get("league", ""))
+        general_match = re.match(r"^(.*)\s-\sGeneral\s*$", league_name, flags=re.IGNORECASE)
+        if not general_match:
+            continue
+        general_base = general_match.group(1).strip().upper()
+        if general_base and general_base in stage_base_keys:
+            keys_to_remove.append(game_id)
+
+    for game_id in keys_to_remove:
+        gamelist.pop(game_id, None)
+
+
 def event_timestamp(event: dict[str, Any], key: str = "date") -> int:
     value = event.get(key, 0)
     if isinstance(value, int):
@@ -4171,6 +4210,7 @@ def main() -> None:
 
     merge_golf_events(gamelist)
     merge_individual_competition_events(gamelist)
+    remove_redundant_cycling_general_events(gamelist)
     update_obsolete_links(gamelist, OBSOLETE_FILE)
 
     mark_cancellations = flashscore_failed_urls == 0
