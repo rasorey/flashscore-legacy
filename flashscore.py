@@ -1898,8 +1898,9 @@ def fetch_event_cards_from_statistics(
     if not stats_payload:
         return None, None, None, None, False
 
-    yellow_home, yellow_away, red_home, red_away, _parsed_any = parse_cards_from_statistics_payload(stats_payload)
-    return yellow_home, yellow_away, red_home, red_away, True
+    yellow_home, yellow_away, red_home, red_away, parsed_any = parse_cards_from_statistics_payload(stats_payload)
+    # Only trust this fetch when card rows were actually parsed; otherwise keep cached/current values.
+    return yellow_home, yellow_away, red_home, red_away, parsed_any
 
 
 def parse_team_standings_rank_map(payload: str) -> dict[str, str]:
