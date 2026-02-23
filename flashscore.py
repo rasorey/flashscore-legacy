@@ -307,7 +307,7 @@ SOFASCORE_CURL_CFFI_IMPORT_WARNED = False
 CARDS_CACHE_VERSION = 2
 CARDS_REFRESH_LOOKAHEAD_HOURS = 2
 CARDS_REFRESH_ACTIVE_WINDOW_HOURS = 8
-CARDS_REFRESH_FINISHED_WINDOW_HOURS = 18
+CARDS_REFRESH_FINISHED_WINDOW_HOURS = 120
 FUTBOLERAS_SEASON_PATTERN = re.compile(r"LIGA-(\d{4})-(\d{4})-", re.IGNORECASE)
 FUTBOLERAS_DATE_TIME_PATTERN = re.compile(
     r"J(?P<journey>\d+)\s+.+?\s+(?P<day>\d{1,2})/(?P<month>\d{1,2})\s+(?P<time>\d{2}:\d{2}|--:--)",
@@ -4194,7 +4194,9 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
     def card_marker(card_icon: str, card_count: int) -> str:
         if card_count <= 0:
             return ""
-        return f"{card_icon}{card_count}"
+        if card_count == 1:
+            return card_icon
+        return f"{card_icon}x{card_count}"
 
     def team_with_cards(team_name: Any, yellow_cards_value: Any, red_cards_value: Any) -> str:
         team_text = str(team_name or "").strip()
