@@ -4242,6 +4242,9 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
         if team1 and team2 and result_status and result_status_is_terminal(result_status):
             name += f" ({result_status})"
 
+    if event_is_finished_for_summary(event):
+        name = f"{name.rstrip()} ✓"
+
     league = competition_override(event)
     if not league:
         league = competition_text_for_summary(event)
@@ -4256,6 +4259,31 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
     if league:
         return f"{name}{league}"
     return name.rstrip()
+
+
+def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
+        return False
+
+    stage_code = parse_stage_code(event.get("event_stage_code", ""))
+    if stage_code == 3:
+        return True
+
+    result_status = str(event.get("result_status", "")).strip()
+    if result_status and result_status_is_final(result_status):
+        return True
+
+    if individual_event_has_published_results(event):
+        return True
+
+    start_ts = event_timestamp(event, "date")
+    end_ts = event_timestamp(event, "date_end")
+    if end_ts > start_ts and end_ts > 0:
+        now_utc = datetime.now(tz=UTC)
+        end_utc = datetime.fromtimestamp(end_ts, tz=UTC)
+        return end_utc <= now_utc
+
+    return False
 
 
 def build_classification_description(event: dict[str, Any]) -> str:
