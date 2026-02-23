@@ -4574,8 +4574,6 @@ def stabilize_finished_individual_event_end(gamelist: dict[str, dict[str, Any]])
         name = build_event_name(event, description)
         inferred_duration = infer_duration(name)
         stabilized_duration = infer_multiday_individual_duration(event, start_utc, inferred_duration)
-        if stabilized_duration < inferred_duration:
-            stabilized_duration = inferred_duration
         if stabilized_duration <= timedelta(minutes=0):
             continue
         event["date_end"] = int((start_utc + stabilized_duration).timestamp())
