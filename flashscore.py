@@ -305,6 +305,9 @@ SOFASCORE_CURL_CFFI_MODULE: Any = None
 SOFASCORE_CURL_CFFI_IMPORT_ATTEMPTED = False
 SOFASCORE_CURL_CFFI_IMPORT_WARNED = False
 CARDS_CACHE_VERSION = 2
+CARDS_REFRESH_LOOKAHEAD_HOURS = 2
+CARDS_REFRESH_ACTIVE_WINDOW_HOURS = 8
+CARDS_REFRESH_FINISHED_WINDOW_HOURS = 18
 FUTBOLERAS_SEASON_PATTERN = re.compile(r"LIGA-(\d{4})-(\d{4})-", re.IGNORECASE)
 FUTBOLERAS_DATE_TIME_PATTERN = re.compile(
     r"J(?P<journey>\d+)\s+.+?\s+(?P<day>\d{1,2})/(?P<month>\d{1,2})\s+(?P<time>\d{2}:\d{2}|--:--)",
@@ -1753,6 +1756,33 @@ def cards_cache_is_valid(cache_entry: Any) -> bool:
     return cache_version >= CARDS_CACHE_VERSION
 
 
+def should_refresh_football_cards(event: dict[str, Any], cache_entry: Any, now_utc: datetime) -> bool:
+    if not should_fetch_football_cards(event):
+        return False
+
+    start_utc = event_datetime_utc(event, "date")
+    if start_utc > now_utc + timedelta(hours=CARDS_REFRESH_LOOKAHEAD_HOURS):
+        return False
+
+    stage_code = parse_stage_code(event.get("event_stage_code", ""))
+    result_status = str(event.get("result_status", "")).strip()
+    is_finished = stage_code == 3 or result_status_is_final(result_status)
+    has_valid_cache = cards_cache_is_valid(cache_entry)
+
+    if not has_valid_cache:
+        if is_finished:
+            return now_utc >= start_utc
+        return now_utc >= start_utc - timedelta(hours=CARDS_REFRESH_LOOKAHEAD_HOURS)
+
+    if is_finished:
+        return (now_utc - start_utc) <= timedelta(hours=CARDS_REFRESH_FINISHED_WINDOW_HOURS)
+    if stage_code == 2:
+        return True
+    if now_utc >= start_utc and (now_utc - start_utc) <= timedelta(hours=CARDS_REFRESH_ACTIVE_WINDOW_HOURS):
+        return True
+    return False
+
+
 def should_fetch_tennis_detail_result(event: dict[str, Any], cache_entry: Any) -> bool:
     if str(event.get("sports", "")).strip().upper() != "TENIS":
         return False
@@ -2151,6 +2181,7 @@ def enrich_events_with_classification(
         return parsed
 
     events_pending_fetch: dict[str, list[dict[str, Any]]] = {}
+    now_utc = datetime.now(tz=UTC)
     for event in gamelist.values():
         if not should_fetch_classification(event):
             continue
@@ -2164,7 +2195,7 @@ def enrich_events_with_classification(
             cache_entry = {}
         valid_cards_cache = cards_cache_is_valid(cache_entry)
 
-        needs_cards_fetch = should_fetch_football_cards(event) and not valid_cards_cache
+        needs_cards_fetch = should_refresh_football_cards(event, cache_entry, now_utc)
         needs_round_fetch = should_fetch_competition_round(event) and "competition_round" not in cache_entry
         needs_tennis_result_fetch = should_fetch_tennis_detail_result(event, cache_entry)
 
@@ -4163,9 +4194,7 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
     def card_marker(card_icon: str, card_count: int) -> str:
         if card_count <= 0:
             return ""
-        if card_count == 1:
-            return card_icon
-        return f"{card_icon}x{card_count}"
+        return f"{card_icon}{card_count}"
 
     def team_with_cards(team_name: Any, yellow_cards_value: Any, red_cards_value: Any) -> str:
         team_text = str(team_name or "").strip()
@@ -4527,6 +4556,31 @@ def apply_end_or_duration(calendar_event: Event, event: dict[str, Any], name: st
         calendar_event.end = end
 
 
+def stabilize_finished_individual_event_end(gamelist: dict[str, dict[str, Any]]) -> None:
+    now_utc = datetime.now(tz=UTC)
+    for event in gamelist.values():
+        if str(event.get("team2", "")).strip():
+            continue
+        if event_timestamp(event, "date_end") > event_timestamp(event, "date"):
+            continue
+        if not individual_event_has_published_results(event):
+            continue
+
+        start_utc = event_datetime_utc(event, "date")
+        if now_utc <= start_utc:
+            continue
+
+        description = build_description(event)
+        name = build_event_name(event, description)
+        inferred_duration = infer_duration(name)
+        stabilized_duration = infer_multiday_individual_duration(event, start_utc, inferred_duration)
+        if stabilized_duration < inferred_duration:
+            stabilized_duration = inferred_duration
+        if stabilized_duration <= timedelta(minutes=0):
+            continue
+        event["date_end"] = int((start_utc + stabilized_duration).timestamp())
+
+
 def build_calendar(gamelist: dict[str, dict[str, Any]]) -> Calendar:
     calendar = Calendar()
 
@@ -4619,6 +4673,7 @@ def main() -> None:
     )
     annotate_first_leg_results(gamelist)
     enrich_events_with_classification(gamelist, CLASSIFICATION_CACHE_FILE)
+    stabilize_finished_individual_event_end(gamelist)
 
     save_pickle(PICKLE_FILE, gamelist)
     calendar = build_calendar(gamelist)
