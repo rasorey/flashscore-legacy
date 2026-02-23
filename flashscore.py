@@ -4242,8 +4242,7 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
         if team1 and team2 and result_status and result_status_is_terminal(result_status):
             name += f" ({result_status})"
 
-    if event_is_finished_for_summary(event):
-        name = f"{name.rstrip()} ✓"
+    check_prefix = "✓ " if event_is_finished_for_summary(event) else ""
 
     league = competition_override(event)
     if not league:
@@ -4255,10 +4254,10 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
     if not league and LEAGUE_FALLBACK_TEXT:
         league = LEAGUE_FALLBACK_TEXT
     if league and (team1 or team2):
-        return f"{name} / {league}"
+        return f"{check_prefix}{name} / {league}"
     if league:
-        return f"{name}{league}"
-    return name.rstrip()
+        return f"{check_prefix}{name}{league}"
+    return f"{check_prefix}{name.rstrip()}"
 
 
 def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
