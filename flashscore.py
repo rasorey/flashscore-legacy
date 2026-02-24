@@ -4264,6 +4264,13 @@ def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
     if str(event.get("status", "")).strip().upper() == "CANCELLED":
         return False
 
+    now_utc = datetime.now(tz=UTC)
+    start_ts = event_timestamp(event, "date")
+    if start_ts > 0:
+        start_utc = datetime.fromtimestamp(start_ts, tz=UTC)
+        if start_utc > now_utc:
+            return False
+
     stage_code = parse_stage_code(event.get("event_stage_code", ""))
     if stage_code == 3:
         return True
@@ -4275,10 +4282,8 @@ def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
     if individual_event_has_published_results(event):
         return True
 
-    start_ts = event_timestamp(event, "date")
     end_ts = event_timestamp(event, "date_end")
     if end_ts > start_ts and end_ts > 0:
-        now_utc = datetime.now(tz=UTC)
         end_utc = datetime.fromtimestamp(end_ts, tz=UTC)
         return end_utc <= now_utc
 
