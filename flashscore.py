@@ -181,10 +181,20 @@ TEAM_CLASSIFICATION_SPORTS = {
     sport.strip().upper()
     for sport in os.environ.get(
         "FLASHSCORE_TEAM_CLASSIFICATION_SPORTS",
-        "FÚTBOL,FUTBOL,FÚTBOL SALA,FUTBOL SALA",
+        (
+            "FÚTBOL,FUTBOL,FÚTBOL SALA,FUTBOL SALA,"
+            "BALONCESTO,BALONMANO,VOLEIBOL,RUGBY,"
+            "HOCKEY SOBRE HIELO,HOCKEY HIERBA"
+        ),
     ).split(",")
     if sport.strip()
 }
+TEAM_CLASSIFICATION_REFRESH_LOOKBACK_DAYS = max(
+    0, int(os.environ.get("FLASHSCORE_TEAM_CLASSIFICATION_REFRESH_LOOKBACK_DAYS", "2"))
+)
+TEAM_CLASSIFICATION_REFRESH_LOOKAHEAD_DAYS = max(
+    0, int(os.environ.get("FLASHSCORE_TEAM_CLASSIFICATION_REFRESH_LOOKAHEAD_DAYS", "30"))
+)
 ROUND_ALWAYS_FETCH_SPORTS = {
     sport.strip().upper()
     for sport in os.environ.get(
@@ -2030,6 +2040,8 @@ def fallback_team_ranks_from_standings(
 def fetch_event_classification(
     session: requests.Session,
     gameid: str,
+    *,
+    prefer_team_standings: bool = False,
 ) -> tuple[
     str,
     str,
@@ -2094,34 +2106,19 @@ def fetch_event_classification(
 
     rank_home = normalize_rank_entry(home_rank_raw)
     rank_away = normalize_rank_entry(away_rank_raw)
-    if rank_home or rank_away:
-        return (
-            rank_home,
-            rank_away,
-            yellow_cards_home,
-            yellow_cards_away,
-            red_cards_home,
-            red_cards_away,
-            competition_round,
-            detail_score_home,
-            detail_score_away,
-            detail_result_status,
-            True,
-            cards_fetched,
+    if prefer_team_standings or not (rank_home or rank_away):
+        fallback_home, fallback_away = fallback_team_ranks_from_standings(
+            session,
+            url,
+            response.text,
+            environment,
+            home_participants,
+            away_participants,
         )
-
-    fallback_home, fallback_away = fallback_team_ranks_from_standings(
-        session,
-        url,
-        response.text,
-        environment,
-        home_participants,
-        away_participants,
-    )
-    if fallback_home:
-        rank_home = fallback_home
-    if fallback_away:
-        rank_away = fallback_away
+        if fallback_home:
+            rank_home = fallback_home
+        if fallback_away:
+            rank_away = fallback_away
 
     return (
         rank_home,
@@ -2163,6 +2160,28 @@ def event_has_sufficient_rank_data(event: dict[str, Any]) -> bool:
     return True
 
 
+def should_use_team_standings(event: dict[str, Any]) -> bool:
+    if not str(event.get("team2", "")).strip():
+        return False
+    if str(event.get("status", "")).strip().upper() == "CANCELLED":
+        return False
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if TEAM_CLASSIFICATION_SPORTS and sport_name not in TEAM_CLASSIFICATION_SPORTS:
+        return False
+    return True
+
+
+def should_force_team_classification_refresh(event: dict[str, Any], now_utc: datetime) -> bool:
+    if not should_use_team_standings(event):
+        return False
+
+    start_utc = event_datetime_utc(event, "date")
+    lower_bound = now_utc - timedelta(days=TEAM_CLASSIFICATION_REFRESH_LOOKBACK_DAYS)
+    upper_bound = now_utc + timedelta(days=TEAM_CLASSIFICATION_REFRESH_LOOKAHEAD_DAYS)
+    return lower_bound <= start_utc <= upper_bound
+
+
 def enrich_events_with_classification(
     gamelist: dict[str, dict[str, Any]],
     cache_file: Path = CLASSIFICATION_CACHE_FILE,
@@ -2181,6 +2200,7 @@ def enrich_events_with_classification(
         return parsed
 
     events_pending_fetch: dict[str, list[dict[str, Any]]] = {}
+    gameids_prefer_team_standings: dict[str, bool] = {}
     now_utc = datetime.now(tz=UTC)
     for event in gamelist.values():
         if not should_fetch_classification(event):
@@ -2194,6 +2214,7 @@ def enrich_events_with_classification(
         if not isinstance(cache_entry, dict):
             cache_entry = {}
         valid_cards_cache = cards_cache_is_valid(cache_entry)
+        force_team_classification_refresh = should_force_team_classification_refresh(event, now_utc)
 
         needs_cards_fetch = should_refresh_football_cards(event, cache_entry, now_utc)
         needs_round_fetch = should_fetch_competition_round(event) and "competition_round" not in cache_entry
@@ -2202,6 +2223,7 @@ def enrich_events_with_classification(
         if (
             CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT
             and event_has_sufficient_rank_data(event)
+            and not force_team_classification_refresh
             and not needs_cards_fetch
             and not needs_round_fetch
             and not needs_tennis_result_fetch
@@ -2247,6 +2269,8 @@ def enrich_events_with_classification(
         fetched_at = cache_entry.get("fetched_at", 0)
         fetched_at_int = int(fetched_at) if str(fetched_at).isdigit() else 0
         is_fresh = ttl_seconds > 0 and fetched_at_int > 0 and (now_timestamp - fetched_at_int) < ttl_seconds
+        if force_team_classification_refresh:
+            is_fresh = False
         if (
             CLASSIFICATION_REFRESH_EMPTY_CACHE
             and not cached_home_rank
@@ -2265,6 +2289,8 @@ def enrich_events_with_classification(
             continue
 
         events_pending_fetch.setdefault(gameid, []).append(event)
+        if should_use_team_standings(event):
+            gameids_prefer_team_standings[gameid] = True
 
     gameids_to_fetch = list(events_pending_fetch.keys())
     if not gameids_to_fetch:
@@ -2380,7 +2406,11 @@ def enrich_events_with_classification(
                     detail_result_status,
                     fetch_ok,
                     cards_fetched,
-                ) = fetch_event_classification(session, gameid)
+                ) = fetch_event_classification(
+                    session,
+                    gameid,
+                    prefer_team_standings=gameids_prefer_team_standings.get(gameid, False),
+                )
                 apply_fetched_data(
                     gameid,
                     rank_home,
@@ -2437,7 +2467,11 @@ def enrich_events_with_classification(
                 detail_result_status,
                 fetch_ok,
                 cards_fetched,
-            ) = fetch_event_classification(session, gameid)
+            ) = fetch_event_classification(
+                session,
+                gameid,
+                prefer_team_standings=gameids_prefer_team_standings.get(gameid, False),
+            )
             return (
                 gameid,
                 rank_home,

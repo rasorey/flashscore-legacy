@@ -54,10 +54,12 @@ Por defecto los archivos se escriben en `/var/www/html`:
 | `FLASHSCORE_CLASSIFICATION_CACHE_TTL_DAYS` | `14` | TTL (días) de caché de clasificaciones. |
 | `FLASHSCORE_CLASSIFICATION_REFRESH_EMPTY_CACHE` | `1` | Refresca caché vacía de clasificación. |
 | `FLASHSCORE_CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT` | `1` | Evita refetch cuando ya hay dato en evento. |
+| `FLASHSCORE_TEAM_CLASSIFICATION_REFRESH_LOOKBACK_DAYS` | `2` | Días hacia atrás (desde ahora) en los que se fuerza refresco de clasificación para deportes de liga por equipos. |
+| `FLASHSCORE_TEAM_CLASSIFICATION_REFRESH_LOOKAHEAD_DAYS` | `30` | Días hacia adelante (desde ahora) en los que se fuerza refresco de clasificación para deportes de liga por equipos. |
 | `FLASHSCORE_INCLUDE_MOTORSPORT_SESSIONS` | `1` | Incluye sesiones de motorsport desde feeds de torneo. |
 | `FLASHSCORE_INDIVIDUAL_MERGE_SPORTS` | `AUTOMOVILISMO,MOTOCICLISMO,CICLISMO` | Deportes individuales a fusionar por competición/fecha. |
 | `FLASHSCORE_CLASSIFICATION_SPORTS` | `TENIS,TENIS DE MESA,BÁDMINTON,BADMINTON` | Deportes con clasificación individual en descripción. |
-| `FLASHSCORE_TEAM_CLASSIFICATION_SPORTS` | `FÚTBOL,FUTBOL,FÚTBOL SALA,FUTBOL SALA` | Deportes con clasificación por equipos. |
+| `FLASHSCORE_TEAM_CLASSIFICATION_SPORTS` | `FÚTBOL,FUTBOL,FÚTBOL SALA,FUTBOL SALA,BALONCESTO,BALONMANO,VOLEIBOL,RUGBY,HOCKEY SOBRE HIELO,HOCKEY HIERBA` | Deportes con clasificación por equipos. |
 | `FLASHSCORE_OVERRUN_EXTENSION_MINUTES` | `30` | Minutos de extensión que se aplican en cada actualización si un evento sigue en curso más allá de la duración prevista. |
 | `FLASHSCORE_OVERRUN_MAX_HOURS` | `12` | Tope de horas para seguir extendiendo automáticamente un evento pasado de duración. |
 | `FLASHSCORE_OVERRUN_EXTENSION_SPORTS` | `AUTOMOVILISMO,MOTOCICLISMO,CICLISMO` | Deportes donde se activa la extensión automática por sobretiempo (orientado a carreras). |
