@@ -4783,9 +4783,11 @@ def stabilize_finished_individual_event_end(gamelist: dict[str, dict[str, Any]])
         if str(event.get("team2", "")).strip():
             continue
         has_valid_date_end = event_timestamp(event, "date_end") > event_timestamp(event, "date")
-        golf_finished = golf_round_is_finished(event)
-        if has_valid_date_end and not golf_finished:
+        if has_valid_date_end:
+            # Keep tournament-level end timestamps (e.g. multi-round golf events)
+            # so future rounds remain present via RRULE.
             continue
+        golf_finished = golf_round_is_finished(event)
         if not golf_finished and not individual_event_has_published_results(event):
             continue
 
