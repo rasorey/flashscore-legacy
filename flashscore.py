@@ -4610,6 +4610,9 @@ def build_description(event: dict[str, Any]) -> str:
 def infer_duration(name: str) -> timedelta:
     upper_name = name.upper()
 
+    if upper_name.startswith("GOLF:"):
+        return timedelta(hours=8)
+
     if any(keyword in upper_name for keyword in ("MOTOGP", "MOTO2", "MOTO3", "MOTO-E")):
         if "ENTRENAMIENTOS" in upper_name:
             return timedelta(minutes=30)
@@ -4691,6 +4694,18 @@ def should_extend_overrun_event(
 def individual_event_has_published_results(event: dict[str, Any]) -> bool:
     if str(event.get("team2", "")).strip():
         return False
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name == "GOLF":
+        if golf_round_is_finished(event):
+            return True
+        if str(event.get("event_stage_code", "")).strip() == "3":
+            return True
+        result_status = normalize_stat_label(event.get("result_status", ""))
+        if result_status and re.search(r"\b(finalizad[oa]?|finished|terminad[oa]?|concluid[oa]?|final)\b", result_status):
+            return True
+        return False
+
     if str(event.get("event_stage_code", "")).strip() == "3":
         return True
     if str(event.get("rank_home", "")).strip() or str(event.get("rank_away", "")).strip():
@@ -4804,27 +4819,89 @@ def stabilize_finished_individual_event_end(gamelist: dict[str, dict[str, Any]])
         event["date_end"] = int((start_utc + stabilized_duration).timestamp())
 
 
+def expand_calendar_instances(event: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    game_id = str(event.get("gameid", "")).strip()
+    if not game_id:
+        return []
+
+    sport_name = str(event.get("sports", "")).strip().upper()
+    if sport_name != "GOLF" or str(event.get("team2", "")).strip():
+        return [(game_id, event)]
+
+    start_ts = event_timestamp(event, "date")
+    end_ts = event_timestamp(event, "date_end")
+    if end_ts <= start_ts:
+        return [(game_id, event)]
+
+    start_utc = datetime.fromtimestamp(start_ts, tz=UTC)
+    end_utc = datetime.fromtimestamp(end_ts, tz=UTC)
+    day_count = (end_utc.date() - start_utc.date()).days + 1
+    if day_count <= 1:
+        return [(game_id, event)]
+
+    finished_day_index: Optional[int] = None
+    finished_at_ts = event_timestamp(event, "golf_round_finished_at")
+    if golf_round_is_finished(event):
+        reference_ts = finished_at_ts
+        if reference_ts <= start_ts:
+            reference_ts = event_timestamp(event, "date_updated")
+        if reference_ts <= start_ts:
+            reference_ts = int(datetime.now(tz=UTC).timestamp())
+        reference_date = datetime.fromtimestamp(reference_ts, tz=UTC).date()
+        candidate_index = (reference_date - start_utc.date()).days
+        if 0 <= candidate_index < day_count:
+            finished_day_index = candidate_index
+
+    instances: list[tuple[str, dict[str, Any]]] = []
+    for day_index in range(day_count):
+        day_start_utc = start_utc + timedelta(days=day_index)
+        day_start_ts = int(day_start_utc.timestamp())
+        day_event = event.copy()
+        day_event["date"] = day_start_ts
+        day_event.pop("date_end", None)
+
+        if finished_day_index is not None and day_index == finished_day_index:
+            day_event["golf_round_finished"] = True
+            day_finish_ts = finished_at_ts
+            if day_finish_ts <= day_start_ts:
+                day_finish_ts = event_timestamp(event, "date_updated")
+            if day_finish_ts > day_start_ts:
+                day_event["golf_round_finished_at"] = day_finish_ts
+                day_event["date_end"] = day_finish_ts
+        else:
+            day_event.pop("golf_round_finished", None)
+            day_event.pop("golf_round_finished_at", None)
+            day_event.pop("golf_hole_status", None)
+            day_event.pop("golf_holes_played", None)
+
+        instance_uid = f"{game_id}-{day_start_utc.strftime('%Y%m%d')}"
+        instances.append((instance_uid, day_event))
+
+    return instances
+
+
 def build_calendar(gamelist: dict[str, dict[str, Any]]) -> Calendar:
     calendar = Calendar()
 
     sorted_events = sorted(gamelist.values(), key=lambda item: (item.get("date", 0), item.get("gameid", "")))
     for event in sorted_events:
-        calendar_event = Event()
-        calendar_event.uid = event["gameid"]
-        description = build_description(event)
-        calendar_event.description = description
-        calendar_event.begin = event_datetime_utc(event)
-        calendar_event.alarms.append(DisplayAlarm(trigger=timedelta(minutes=-15)))
+        for instance_uid, instance_event in expand_calendar_instances(event):
+            calendar_event = Event()
+            calendar_event.uid = instance_uid
+            description = build_description(instance_event)
+            calendar_event.description = description
+            calendar_event.begin = event_datetime_utc(instance_event)
+            calendar_event.alarms.append(DisplayAlarm(trigger=timedelta(minutes=-15)))
 
-        name = build_event_name(event, description)
-        calendar_event.name = name
-        calendar_event.status = event.get("status", "CONFIRMED")
+            name = build_event_name(instance_event, description)
+            calendar_event.name = name
+            calendar_event.status = instance_event.get("status", "CONFIRMED")
 
-        if event.get("all_day", False):
-            calendar_event.make_all_day()
+            if instance_event.get("all_day", False):
+                calendar_event.make_all_day()
 
-        apply_end_or_duration(calendar_event, event, name)
-        calendar.events.add(calendar_event)
+            apply_end_or_duration(calendar_event, instance_event, name)
+            calendar.events.add(calendar_event)
 
     return calendar
 
