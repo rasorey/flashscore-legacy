@@ -4313,13 +4313,15 @@ def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
     if result_status and result_status_is_final(result_status):
         return True
 
-    if individual_event_has_published_results(event):
-        return True
-
     end_ts = event_timestamp(event, "date_end")
     if end_ts > start_ts and end_ts > 0:
         end_utc = datetime.fromtimestamp(end_ts, tz=UTC)
-        return end_utc <= now_utc
+        if end_utc > now_utc:
+            return False
+        return True
+
+    if individual_event_has_published_results(event):
+        return True
 
     return False
 
