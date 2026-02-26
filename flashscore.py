@@ -104,6 +104,7 @@ FLASHSCORE_URLS = [
     "https://www.flashscore.es/jugador/martin-jorge/zBBka6dR/partidos/",
     "https://www.flashscore.es/jugador/molina-miguel/8649E4Zn/partidos/",
     "https://www.flashscore.es/jugador/palou-alex/KCYsXBsC/partidos/",
+    "https://www.flashscore.es/jugador/quiles-maximo/vonqlvDM/",
     "https://www.flashscore.es/jugador/sainz-carlos-jr/l6kEzjTF/partidos/",
     "https://www.flashscore.es/jugador/sainz-carlos-sr/KOjcVmad/partidos/",
     "https://www.flashscore.es/jugador/sordo-dani/QHgmhx5C/partidos/",
