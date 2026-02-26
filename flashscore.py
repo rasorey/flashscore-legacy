@@ -159,6 +159,11 @@ CLASSIFICATION_REFRESH_EMPTY_CACHE = os.environ.get("FLASHSCORE_CLASSIFICATION_R
 CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT = os.environ.get("FLASHSCORE_CLASSIFICATION_SKIP_FETCH_WHEN_PRESENT", "1") == "1"
 INCLUDE_MOTORSPORT_SESSIONS = os.environ.get("FLASHSCORE_INCLUDE_MOTORSPORT_SESSIONS", "1") == "1"
 MOTORSPORT_SPORT_SLUGS = {"motorsport-auto-racing", "motorsport-moto-racing", "cycling"}
+FLASHSCORE_SPORT_SLUG_NAME_MAP = {
+    "motorsport-auto-racing": "Automovilismo",
+    "motorsport-moto-racing": "Motociclismo",
+    "cycling": "Ciclismo",
+}
 MOTORSPORT_POSITION_FIELD_KEYS = ("CX", "WS", "NI")
 TEAM_STANDINGS_DEFAULT_VIEW_ID = "1"
 FEED_CONTEXT_KEYS = ("SA", "ZEE", "ZHS", "ZL", "ZY", "ZB", "ZAF")
@@ -1522,6 +1527,20 @@ def extract_sport_name(soup: BeautifulSoup) -> str:
     if "," in title_text:
         title_text = title_text.split(",", 1)[0]
     return title_text.split("Flashscore.es / ")[-1].strip()
+
+
+def resolve_page_sport_name(soup: BeautifulSoup, page_html: str, url: str) -> str:
+    sport_name = extract_sport_name(soup)
+    if "/jugador/" not in url:
+        return sport_name
+
+    sport_slug = extract_sport_slug(page_html)
+    # Player profile pages in motorsports/cycling can expose country in <title>
+    # instead of sport, so prefer slug-based sport when available.
+    mapped_sport_name = FLASHSCORE_SPORT_SLUG_NAME_MAP.get(sport_slug, "")
+    if mapped_sport_name:
+        return mapped_sport_name
+    return sport_name
 
 
 def parse_tv_channels(tv_raw: Optional[str]) -> list[str]:
@@ -3575,7 +3594,7 @@ def scrape_flashscore_url(
 
         page_html = response.text
         soup = BeautifulSoup(page_html, "html.parser")
-        sport_name = extract_sport_name(soup)
+        sport_name = resolve_page_sport_name(soup, page_html, url)
         page_game_fields: dict[str, dict[str, str]] = {}
         page_game_blobs: dict[str, list[str]] = {}
         page_chunks: list[tuple[dict[str, str], str]] = []
