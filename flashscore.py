@@ -165,6 +165,7 @@ FLASHSCORE_SPORT_SLUG_NAME_MAP = {
     "cycling": "Ciclismo",
 }
 MOTORSPORT_POSITION_FIELD_KEYS = ("CX", "WS", "NI")
+GOLF_ROUND_FINISHED_MARKERS = {"F", "FIN", "FINISHED", "FINAL"}
 TEAM_STANDINGS_DEFAULT_VIEW_ID = "1"
 FEED_CONTEXT_KEYS = ("SA", "ZEE", "ZHS", "ZL", "ZY", "ZB", "ZAF")
 INDIVIDUAL_COMPETITION_MERGE_SPORTS = {
@@ -2774,6 +2775,29 @@ def extract_individual_position(fields: dict[str, str]) -> str:
     return ""
 
 
+def extract_golf_round_progress(fields: dict[str, str]) -> tuple[str, Optional[int], bool]:
+    hole_status = str(fields.get("GH", "")).strip().upper()
+    holes_played = parse_counter_value(fields.get("GS"))
+    normalized_status = re.sub(r"[^A-Z0-9]", "", hole_status)
+    is_round_finished = normalized_status in GOLF_ROUND_FINISHED_MARKERS
+    return hole_status, holes_played, is_round_finished
+
+
+def resolve_golf_round_finished_timestamp(
+    start_ts: int,
+    date_updated_ts: int,
+) -> int:
+    if date_updated_ts > start_ts:
+        duration_seconds = date_updated_ts - start_ts
+        if 45 * 60 <= duration_seconds <= 18 * 60 * 60:
+            return date_updated_ts
+
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    if now_ts > start_ts:
+        return now_ts
+    return 0
+
+
 def extract_result_status(fields: dict[str, str]) -> str:
     status_keys = ("AS", "AB", "AC", "AX", "AT", "AU")
     for key in status_keys:
@@ -3088,6 +3112,21 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         if date_updated_ts >= int(timestamp_raw):
             event["date_updated"] = date_updated_ts
 
+    if str(sport_name).strip().upper() == "GOLF":
+        golf_hole_status, golf_holes_played, golf_round_finished = extract_golf_round_progress(fields)
+        if golf_hole_status:
+            event["golf_hole_status"] = golf_hole_status
+        if golf_holes_played is not None:
+            event["golf_holes_played"] = golf_holes_played
+        if golf_round_finished:
+            event["golf_round_finished"] = True
+            round_finished_ts = resolve_golf_round_finished_timestamp(
+                int(timestamp_raw),
+                event_timestamp(event, "date_updated"),
+            )
+            if round_finished_ts > int(timestamp_raw):
+                event["golf_round_finished_at"] = round_finished_ts
+
     team2 = fields.get("AF")
     if team2:
         event["team2"] = team2
@@ -3124,6 +3163,49 @@ def build_event(fields: dict[str, str], sport_name: str, event_blob: str = "") -
         event["tv"] = tv_channels
 
     return event
+
+
+def event_flag_is_true(event: dict[str, Any], key: str) -> bool:
+    value = event.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def merge_golf_round_state(base_event: dict[str, Any], other_event: dict[str, Any]) -> None:
+    base_hole_status = str(base_event.get("golf_hole_status", "")).strip()
+    other_hole_status = str(other_event.get("golf_hole_status", "")).strip()
+    if not base_hole_status and other_hole_status:
+        base_event["golf_hole_status"] = other_hole_status
+
+    base_holes_played = parse_counter_value(base_event.get("golf_holes_played"))
+    other_holes_played = parse_counter_value(other_event.get("golf_holes_played"))
+    if other_holes_played is not None and (base_holes_played is None or other_holes_played > base_holes_played):
+        base_event["golf_holes_played"] = other_holes_played
+
+    if event_flag_is_true(base_event, "golf_round_finished") or event_flag_is_true(other_event, "golf_round_finished"):
+        base_event["golf_round_finished"] = True
+    else:
+        base_event.pop("golf_round_finished", None)
+
+    start_ts = event_timestamp(base_event, "date")
+    finished_ts_candidates = [
+        ts
+        for ts in (
+            event_timestamp(base_event, "golf_round_finished_at"),
+            event_timestamp(other_event, "golf_round_finished_at"),
+        )
+        if ts > start_ts
+    ]
+    if finished_ts_candidates:
+        # Keep earliest known detection timestamp to avoid drift across refreshes.
+        base_event["golf_round_finished_at"] = min(finished_ts_candidates)
+    else:
+        base_event.pop("golf_round_finished_at", None)
 
 
 def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str, Any]) -> dict[str, Any]:
@@ -3191,6 +3273,8 @@ def merge_event_payload(existing_event: dict[str, Any], incoming_event: dict[str
             merged["participant_rankings"] = merged_rankings
     elif not existing_rankings and isinstance(incoming_rankings, list) and incoming_rankings:
         merged["participant_rankings"] = incoming_rankings
+
+    merge_golf_round_state(merged, incoming_event)
 
     return merged
 
@@ -3756,6 +3840,16 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
             updated_ts = event_timestamp(event, "date_updated")
             if updated_ts > event_timestamp(golf_merged[first_game_id], "date_updated"):
                 golf_merged[first_game_id]["date_updated"] = updated_ts
+            golf_merged[first_game_id]["_golf_tracked_participants"] = (
+                parse_counter_value(golf_merged[first_game_id].get("_golf_tracked_participants")) or 0
+            ) + 1
+            if event_flag_is_true(event, "golf_round_finished"):
+                golf_merged[first_game_id]["_golf_finished_participants"] = (
+                    parse_counter_value(golf_merged[first_game_id].get("_golf_finished_participants")) or 0
+                ) + 1
+                incoming_finished_at = event_timestamp(event, "golf_round_finished_at")
+                if incoming_finished_at > event_timestamp(golf_merged[first_game_id], "golf_round_finished_at"):
+                    golf_merged[first_game_id]["golf_round_finished_at"] = incoming_finished_at
             keys_to_remove.append(game_id)
             continue
 
@@ -3764,6 +3858,8 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
         event_copy["participant_rankings"] = []
         if participant_name and participant_rank:
             event_copy["participant_rankings"].append(f"{participant_name} ({participant_rank})")
+        event_copy["_golf_tracked_participants"] = 1
+        event_copy["_golf_finished_participants"] = 1 if event_flag_is_true(event, "golf_round_finished") else 0
         golf_merged[game_id] = event_copy
         merge_key_to_first_gameid[merge_key] = game_id
         keys_to_remove.append(game_id)
@@ -3799,6 +3895,15 @@ def merge_golf_events(gamelist: dict[str, dict[str, Any]]) -> None:
         merged_event["team1"] = "/".join(unique_participants)
         merged_event.pop("rank_home", None)
         merged_event.pop("rank_away", None)
+        tracked_participants = parse_counter_value(merged_event.get("_golf_tracked_participants")) or 0
+        finished_participants = parse_counter_value(merged_event.get("_golf_finished_participants")) or 0
+        if tracked_participants > 0 and finished_participants >= tracked_participants:
+            merged_event["golf_round_finished"] = True
+        else:
+            merged_event.pop("golf_round_finished", None)
+            merged_event.pop("golf_round_finished_at", None)
+        merged_event.pop("_golf_tracked_participants", None)
+        merged_event.pop("_golf_finished_participants", None)
         if unique_rankings:
             merged_event["participant_rankings"] = unique_rankings
         else:
@@ -4192,6 +4297,8 @@ def enrich_event_with_existing_data(event: dict[str, Any], existing_event: dict[
     elif not current_rankings and isinstance(existing_rankings, list) and existing_rankings:
         enriched["participant_rankings"] = existing_rankings
 
+    merge_golf_round_state(enriched, existing_event)
+
     return enriched
 
 
@@ -4314,6 +4421,17 @@ def build_event_name(event: dict[str, Any], description: str = "") -> str:
     return f"{check_prefix}{name.rstrip()}"
 
 
+def golf_round_is_finished(event: dict[str, Any]) -> bool:
+    if str(event.get("sports", "")).strip().upper() != "GOLF":
+        return False
+    if event_flag_is_true(event, "golf_round_finished"):
+        return True
+
+    hole_status = str(event.get("golf_hole_status", "")).strip().upper()
+    normalized_status = re.sub(r"[^A-Z0-9]", "", hole_status)
+    return normalized_status in GOLF_ROUND_FINISHED_MARKERS
+
+
 def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
     if str(event.get("status", "")).strip().upper() == "CANCELLED":
         return False
@@ -4331,6 +4449,9 @@ def event_is_finished_for_summary(event: dict[str, Any]) -> bool:
 
     result_status = str(event.get("result_status", "")).strip()
     if result_status and result_status_is_final(result_status):
+        return True
+
+    if golf_round_is_finished(event):
         return True
 
     end_ts = event_timestamp(event, "date_end")
@@ -4600,6 +4721,16 @@ def infer_multiday_individual_duration(
 
     sport_name = str(event.get("sports", "")).strip().upper()
     if sport_name == "GOLF":
+        if golf_round_is_finished(event):
+            start_ts = event_timestamp(event, "date")
+            finished_ts = event_timestamp(event, "golf_round_finished_at")
+            if finished_ts <= start_ts:
+                finished_ts = event_timestamp(event, "date_updated")
+            if finished_ts > start_ts:
+                finished_utc = datetime.fromtimestamp(finished_ts, tz=UTC)
+                dynamic_duration = finished_utc - start_utc
+                if timedelta(minutes=45) <= dynamic_duration <= timedelta(hours=18):
+                    return dynamic_duration
         return timedelta(hours=8)
     if sport_name == "CICLISMO" and stage_code == "3":
         return timedelta(hours=5)
@@ -4651,9 +4782,11 @@ def stabilize_finished_individual_event_end(gamelist: dict[str, dict[str, Any]])
     for event in gamelist.values():
         if str(event.get("team2", "")).strip():
             continue
-        if event_timestamp(event, "date_end") > event_timestamp(event, "date"):
+        has_valid_date_end = event_timestamp(event, "date_end") > event_timestamp(event, "date")
+        golf_finished = golf_round_is_finished(event)
+        if has_valid_date_end and not golf_finished:
             continue
-        if not individual_event_has_published_results(event):
+        if not golf_finished and not individual_event_has_published_results(event):
             continue
 
         start_utc = event_datetime_utc(event, "date")
